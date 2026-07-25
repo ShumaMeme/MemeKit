@@ -7,7 +7,6 @@ from typing import Callable, Optional
 
 from .dumper_core import DumperCore
 from . import mtio
-from .http_file import HttpRangeFileMTIO
 
 
 def extract(
@@ -42,10 +41,7 @@ def extract(
 
     payload_file = None
     try:
-        if source_path.startswith('http://') or source_path.startswith('https://'):
-            payload_file = HttpRangeFileMTIO(source_path)
-        else:
-            payload_file = mtio.MTFile(source_path, 'r')
+        payload_file = mtio.MTFile(source_path, 'r')
 
         dumper = DumperCore(
             payload_file=payload_file,

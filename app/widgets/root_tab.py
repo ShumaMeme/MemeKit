@@ -6,22 +6,20 @@ import gzip
 import time
 from pathlib import Path
 from typing import List, Tuple
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QFileDialog, QGridLayout
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFileDialog
 from qfluentwidgets import (
     PrimaryPushButton,
     PushButton,
     InfoBar,
     InfoBarPosition,
     CardWidget,
-    TitleLabel,
     FluentIcon,
     SmoothScrollArea,
     ComboBox,
-    BodyLabel,
-    CaptionLabel,
     LineEdit,
 )
-from PySide6.QtCore import Qt, QThread, Signal, QObject, QTimer, QSize
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSize
+from PySide6.QtGui import QFont
 
 from app.services import adb_service
 from app.components.log_widget import LogWidget
@@ -67,18 +65,29 @@ class _RootRefreshThread(QThread):
     """后台线程：刷新设备信息，使用 ADB Server Socket 直连"""
     result_ready = Signal(dict)
 
+    def __init__(self, serial: str = "", parent=None):
+        super().__init__(parent)
+        self._serial = str(serial or "")
+
     def run(self):
         result = {}
         try:
             adb_client = adb_service._adb_server(timeout=2.0)
             devs = adb_client.host_devices(timeout=2.0)
-            serial = ""
+            serial = self._serial
             mode = "none"
-            for s, st in devs:
-                if st == "device":
-                    serial = s
-                    mode = "system"
-                    break
+            # 如果指定了 serial，优先使用它；否则回退到第一台 device
+            if serial:
+                for s, st in devs:
+                    if s == serial:
+                        mode = "system" if st == "device" else "offline"
+                        break
+            else:
+                for s, st in devs:
+                    if st == "device":
+                        serial = s
+                        mode = "system"
+                        break
             result["mode"] = mode
             result["serial"] = serial
             if mode == "system" and serial:
@@ -108,6 +117,224 @@ class _RootWatchTickThread(QThread):
             self._state = None
 
 
+class _ClearRootWorker(QThread):
+    """清除 ROOT 权限的后台线程。
+
+    流程：自动检测设备模式（adb/fastbootd/bootloader），
+    必要时重启到 bootloader，然后用原版 boot/init_boot.img 刷写覆盖修补镜像，
+    最后重启回系统。
+    """
+    log = Signal(str)
+    result_ready = Signal(int)
+    stage = Signal(str)
+    step_start = Signal(str, str)
+    step_finish = Signal(str, bool, str)
+
+    def __init__(self, *, boot_img: str, flash_partition: str,
+                 adb_path: str, fastboot_path: str, serial: str = "", parent=None):
+        super().__init__(parent)
+        self.boot_img = str(boot_img or "").strip()
+        self.flash_partition = str(flash_partition or "boot").strip() or "boot"
+        self.adb = adb_path
+        self.fastboot = fastboot_path
+        self.serial = str(serial or "")
+        self._stop_flag = False
+        self._current_proc = None
+
+    def _sleep(self, secs: float):
+        end = time.time() + secs
+        while time.time() < end:
+            if self._stop_flag:
+                return
+            time.sleep(0.1)
+
+    def _run_cmd(self, cmd: List[str], timeout=None, *, quiet: bool = False) -> Tuple[int, str]:
+        proc = None
+        try:
+            startupinfo = None
+            if os.name == 'nt':
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                startupinfo=startupinfo,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+            )
+            self._current_proc = proc
+
+            out_lines = []
+            while True:
+                if self._stop_flag:
+                    try:
+                        proc.terminate()
+                        try:
+                            if proc.stdout:
+                                proc.stdout.close()
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                    break
+                if proc.stdout is None:
+                    break
+                line = proc.stdout.readline()
+                if not line:
+                    if proc.poll() is not None:
+                        break
+                    try:
+                        proc.wait(timeout=1)
+                    except Exception:
+                        pass
+                    break
+                s = line.strip()
+                if s and not quiet:
+                    self.log.emit(s)
+                out_lines.append(s)
+
+            try:
+                exit_code = proc.wait(timeout=5) if proc.poll() is None else proc.poll()
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait()
+                except Exception:
+                    pass
+                exit_code = -1
+            return exit_code, "\n".join(out_lines)
+        except Exception as e:
+            return -1, str(e)
+        finally:
+            self._current_proc = None
+
+    def run(self):
+        import uuid
+        try:
+            boot_path = Path(self.boot_img)
+            if not boot_path.exists() or not boot_path.is_file():
+                self.log.emit("原版镜像路径无效")
+                self.result_ready.emit(-1)
+                return
+
+            # 1) 检测当前设备模式
+            sid_detect = str(uuid.uuid4())
+            self.stage.emit("detect")
+            self.step_start.emit(sid_detect, "检测设备模式")
+            mode, serial = adb_service.detect_connection_mode()
+            # 优先使用用户选中的设备
+            if self.serial:
+                serial = self.serial
+                # 通过 list_devices 验证设备在线
+                try:
+                    online_serials = adb_service.list_devices()
+                except Exception:
+                    online_serials = []
+                if serial not in online_serials:
+                    self.log.emit(f"所选设备 {serial} 不在线")
+                    self.step_finish.emit(sid_detect, False, "设备不在线")
+                    self.result_ready.emit(-1)
+                    return
+                mode = "system"
+            if mode == "none" or not serial:
+                self.log.emit("未检测到设备，请确保手机已连接")
+                self.step_finish.emit(sid_detect, False, "未检测到设备")
+                self.result_ready.emit(-1)
+                return
+            self.log.emit(f"当前模式：{mode}（{serial}）")
+            self.step_finish.emit(sid_detect, True, mode)
+
+            # 2) 如果不在 bootloader，先重启到 bootloader
+            if mode != "bootloader":
+                sid_reboot_fb = str(uuid.uuid4())
+                self.stage.emit("reboot_to_bootloader")
+                self.step_start.emit(sid_reboot_fb, "重启至 Bootloader")
+                if mode == "system":
+                    self.log.emit("通过 ADB 重启至 bootloader...")
+                    code, out = self._run_cmd([self.adb, "-s", serial, "reboot", "bootloader"])
+                elif mode == "fastbootd":
+                    self.log.emit("从 Fastbootd 切回 Bootloader...")
+                    code, out = self._run_cmd([self.fastboot, "-s", serial, "reboot-bootloader"])
+                else:
+                    self.log.emit(f"当前模式 {mode} 不支持自动重启到 bootloader，请手动进入 Bootloader 后重试")
+                    self.step_finish.emit(sid_reboot_fb, False, f"不支持的模式：{mode}")
+                    self.result_ready.emit(-1)
+                    return
+                if code != 0:
+                    self.step_finish.emit(sid_reboot_fb, False, "重启失败")
+                    self.result_ready.emit(-1)
+                    return
+                self.step_finish.emit(sid_reboot_fb, True, "")
+                # 等待设备进入 bootloader 并被 fastboot 识别
+                self.log.emit("等待设备进入 Bootloader...")
+                self._sleep(8)
+                # 轮询确认 fastboot 能识别到设备
+                ok = False
+                for _ in range(10):
+                    if self._stop_flag:
+                        self.result_ready.emit(-2)
+                        return
+                    out = adb_service._run([self.fastboot, "devices"], timeout=2)
+                    if out and out.strip():
+                        ok = True
+                        break
+                    self._sleep(1)
+                if not ok:
+                    self.log.emit("等待 Fastboot 设备超时，请确认手机已进入 Bootloader 模式")
+                    self.result_ready.emit(-1)
+                    return
+
+            # 3) 刷写原版镜像覆盖修补镜像
+            sid_flash = str(uuid.uuid4())
+            self.stage.emit("flash")
+            self.step_start.emit(sid_flash, f"刷入原版镜像 ({self.flash_partition})")
+            self.log.emit(f"正在刷写原版镜像到 {self.flash_partition} 分区...")
+            code, out = self._run_cmd(
+                [self.fastboot, "flash", self.flash_partition, str(boot_path)]
+            )
+            if code != 0:
+                self.step_finish.emit(sid_flash, False, "刷写失败")
+                self.log.emit(f"刷写失败：{out}")
+                self.result_ready.emit(-1)
+                return
+            self.step_finish.emit(sid_flash, True, "")
+
+            # 4) 重启回系统
+            sid_reboot = str(uuid.uuid4())
+            self.stage.emit("reboot")
+            self.step_start.emit(sid_reboot, "重启系统")
+            self.log.emit("刷写成功，正在重启系统...")
+            self._run_cmd([self.fastboot, "reboot"])
+            self.step_finish.emit(sid_reboot, True, "")
+
+            self.log.emit("恭喜你，ROOT 权限已成功清除")
+            self.result_ready.emit(0)
+
+        except Exception as e:
+            self.log.emit(f"发生未知错误: {e}")
+            self.result_ready.emit(-1)
+
+    def stop(self):
+        self._stop_flag = True
+        try:
+            if self._current_proc and self._current_proc.poll() is None:
+                self._current_proc.terminate()
+                try:
+                    if self._current_proc.stdout:
+                        self._current_proc.stdout.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
 class _GuidedRootWorker(QThread):
     log = Signal(str)
     result_ready = Signal(int)
@@ -125,6 +352,7 @@ class _GuidedRootWorker(QThread):
         flash_partition: str,
         adb_path: str,
         fastboot_path: str,
+        serial: str = "",
         parent=None,
     ):
         super().__init__(parent)
@@ -136,6 +364,7 @@ class _GuidedRootWorker(QThread):
         self.flash_partition = str(flash_partition or "boot").strip() or "boot"
         self.adb = adb_path
         self.fastboot = fastboot_path
+        self.serial = str(serial or "")
         self.work_dir = Path("root_work")
         self._stop_flag = False
         self._current_proc = None
@@ -229,6 +458,10 @@ class _GuidedRootWorker(QThread):
                 return
 
             mode, serial = adb_service.detect_connection_mode()
+            # 优先使用用户选中的设备
+            if self.serial:
+                serial = self.serial
+                mode = "system"
             if mode != 'system' or not serial:
                 self.log.emit("请确保手机在系统模式并连接 ADB")
                 self.result_ready.emit(-1)
@@ -283,7 +516,7 @@ class _GuidedRootWorker(QThread):
                 self.log.emit(f"{self.manager_name} 安装成功")
                 self.step_finish.emit(sid_install, True, "")
             else:
-                self.log.emit(f"安装失败，请手动安装 APK 后重试")
+                self.log.emit("安装失败，请手动安装 APK 后重试")
                 self.log.emit(f"APK 路径：{remote_dir}/root_manager.apk")
                 self.step_finish.emit(sid_install, False, "安装失败")
                 self.result_ready.emit(-1)
@@ -520,6 +753,8 @@ class RootTab(QWidget):
         self._fastboot = self._resolve_bin("fastboot")
         self._thread: QThread | None = None
         self._worker: _GuidedRootWorker | None = None
+        self._clear_thread: QThread | None = None
+        self._clear_worker: _ClearRootWorker | None = None
         self._watch_worker = None  # 兼容旧引用
         self._watch_timer = None
         self._watch_tick_thread = None
@@ -527,7 +762,19 @@ class RootTab(QWidget):
         self._refresh_thread: QThread | None = None
         self._refreshing = False
         self._did_first_show = False
+        self._current_serial = ""
         self._build_ui()
+
+    def set_current_serial(self, serial: str):
+        """接收仪表盘广播的设备 serial，刷新设备信息。"""
+        new_serial = str(serial or "").strip()
+        if new_serial == self._current_serial:
+            return
+        self._current_serial = new_serial
+        try:
+            self._refresh_device_info()
+        except Exception:
+            pass
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -566,11 +813,11 @@ class RootTab(QWidget):
         self.v_layout.addWidget(self.scroll)
 
         self.container = QWidget()
-        self.container.setStyleSheet("QWidget {background: transparent;}")
+        self.container.setStyleSheet("background: transparent;")
         self.scroll.setWidget(self.container)
 
         self.layout = QVBoxLayout(self.container)
-        self.layout.setContentsMargins(32, 32, 32, 32)
+        self.layout.setContentsMargins(20, 20, 20, 20)
         self.layout.setSpacing(24)
 
         main_h_layout = QHBoxLayout()
@@ -582,6 +829,7 @@ class RootTab(QWidget):
         self._build_status_card(left_col)
         self._build_options_card(left_col)
         self._build_action_card(left_col)
+        self._build_clear_root_card(left_col)
         left_col.addStretch(1)
         
         right_col = QVBoxLayout()
@@ -628,7 +876,7 @@ class RootTab(QWidget):
         
         btn_refresh = PushButton(FluentIcon.SYNC, "刷新状态")
         btn_refresh.setFixedHeight(32)
-        btn_refresh.clicked.connect(self._refresh_device_info)
+        btn_refresh.clicked.connect(self._on_refresh_clicked)
         self.btn_refresh = btn_refresh
         
         status_row.addLayout(info_lay, 1)
@@ -700,7 +948,10 @@ class RootTab(QWidget):
         self.btn_start.setFixedHeight(44)
         self.btn_start.setIcon(FluentIcon.PLAY)
         self.btn_start.setIconSize(QSize(16, 16))
-        self.btn_start.setStyleSheet("font-size: 16px; font-weight: bold;")
+        btn_font = QFont()
+        btn_font.setPointSize(12)
+        btn_font.setBold(True)
+        self.btn_start.setFont(btn_font)
         self.btn_start.clicked.connect(self._start)
         
         self.btn_cancel = PushButton(FluentIcon.CLOSE, "终止任务")
@@ -711,7 +962,39 @@ class RootTab(QWidget):
         lay.addWidget(self.btn_start)
         lay.addSpacing(12)
         lay.addWidget(self.btn_cancel)
-        
+
+        parent_layout.addWidget(card)
+
+    def _build_clear_root_card(self, parent_layout):
+        card = CardWidget()
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(24, 24, 24, 24)
+
+        desc = QLabel("使用上方选中的原版 boot/init_boot.img 重新刷写，覆盖修补镜像以清除 Root")
+        desc.setStyleSheet("font-size: 13px; color: #86909c;")
+        desc.setWordWrap(True)
+        lay.addWidget(desc)
+        lay.addSpacing(10)
+
+        self.btn_clear_root = PrimaryPushButton("清除 Root 权限")
+        self.btn_clear_root.setFixedHeight(44)
+        self.btn_clear_root.setIcon(FluentIcon.DELETE)
+        self.btn_clear_root.setIconSize(QSize(16, 16))
+        btn_font2 = QFont()
+        btn_font2.setPointSize(12)
+        btn_font2.setBold(True)
+        self.btn_clear_root.setFont(btn_font2)
+        self.btn_clear_root.clicked.connect(self._start_clear_root)
+
+        self.btn_clear_cancel = PushButton(FluentIcon.CLOSE, "终止任务")
+        self.btn_clear_cancel.setFixedHeight(36)
+        self.btn_clear_cancel.setEnabled(False)
+        self.btn_clear_cancel.clicked.connect(self._cancel_clear_root)
+
+        lay.addWidget(self.btn_clear_root)
+        lay.addSpacing(12)
+        lay.addWidget(self.btn_clear_cancel)
+
         parent_layout.addWidget(card)
 
     def _build_log_card(self, parent_layout):
@@ -741,6 +1024,11 @@ class RootTab(QWidget):
         parent_layout.addWidget(card, 1)
 
     def _start(self):
+        try:
+            from app.services import log_service
+            log_service.log_ui_action("Root-开始", self.combo_root.currentText() if hasattr(self, 'combo_root') else "")
+        except Exception:
+            pass
         if self._thread and self._thread.isRunning():
             InfoBar.info("提示", "已有任务在执行中", parent=self, position=InfoBarPosition.TOP, isClosable=True)
             return
@@ -773,6 +1061,7 @@ class RootTab(QWidget):
             flash_partition=part,
             adb_path=self._adb,
             fastboot_path=self._fastboot,
+            serial=self._current_serial,
             parent=self,
         )
         self._worker = self._thread  # 兼容旧引用
@@ -824,18 +1113,42 @@ class RootTab(QWidget):
     def _on_finished(self, code):
         self.btn_start.setEnabled(True)
         self.btn_cancel.setEnabled(False)
+        try:
+            from app.services import log_service
+        except Exception:
+            log_service = None
         if code == 0:
             InfoBar.success("完成", "Root 流程执行完毕", parent=self, position=InfoBarPosition.TOP)
+            if log_service:
+                try:
+                    log_service.log_operation("Root", success=True)
+                except Exception:
+                    pass
         elif code == -2:
             InfoBar.info("已取消", "任务已取消", parent=self, position=InfoBarPosition.TOP, isClosable=True)
+            if log_service:
+                try:
+                    log_service.log_operation("Root", success=False, detail="用户取消")
+                except Exception:
+                    pass
         else:
             InfoBar.error("失败", "Root 流程遇到错误，请查看日志", parent=self, position=InfoBarPosition.TOP)
+            if log_service:
+                try:
+                    log_service.log_operation("Root", success=False, detail=f"code={code}")
+                except Exception:
+                    pass
 
     def _on_thread_finished(self):
         self._thread = None
         self._worker = None
 
     def _cancel(self):
+        try:
+            from app.services import log_service
+            log_service.log_ui_action("Root-取消")
+        except Exception:
+            pass
         try:
             if self._worker:
                 self._worker.stop()
@@ -849,10 +1162,119 @@ class RootTab(QWidget):
         except Exception:
             pass
 
+    def _start_clear_root(self):
+        try:
+            from app.services import log_service
+            log_service.log_ui_action("Root-清除Root")
+        except Exception:
+            pass
+        # 防止与一键 ROOT 任务冲突
+        if (self._thread and self._thread.isRunning()) or \
+           (self._clear_thread and self._clear_thread.isRunning()):
+            InfoBar.info("提示", "已有任务在执行中", parent=self, position=InfoBarPosition.TOP, isClosable=True)
+            return
+
+        boot_img = (self.edt_boot.text() or "").strip()
+        if not boot_img:
+            InfoBar.warning("提示", "请先选择原版 boot.img 或 init_boot.img", parent=self, position=InfoBarPosition.TOP, isClosable=True)
+            return
+        if not Path(boot_img).exists():
+            InfoBar.warning("提示", "原版镜像路径不存在", parent=self, position=InfoBarPosition.TOP, isClosable=True)
+            return
+
+        part = str(self.combo_part.currentText() or "boot").strip() or "boot"
+
+        self.log.clear_log()
+        self.btn_clear_root.setEnabled(False)
+        self.btn_clear_cancel.setEnabled(True)
+        # 同步禁用一键 ROOT 入口，避免并发冲突
+        self.btn_start.setEnabled(False)
+
+        self._clear_thread = _ClearRootWorker(
+            boot_img=boot_img,
+            flash_partition=part,
+            adb_path=self._adb,
+            fastboot_path=self._fastboot,
+            serial=self._current_serial,
+            parent=self,
+        )
+        self._clear_worker = self._clear_thread
+
+        self._clear_thread.log.connect(self.log.append_log)
+        self._clear_thread.step_start.connect(self.log.start_step)
+        self._clear_thread.step_finish.connect(self.log.finish_step)
+        self._clear_thread.result_ready.connect(self._on_clear_root_finished)
+        self._clear_thread.result_ready.connect(self._clear_thread.quit)
+        self._clear_thread.result_ready.connect(self._clear_thread.deleteLater)
+        self._clear_thread.finished.connect(self._on_clear_root_thread_finished)
+        InfoBar.info("开始", "清除 Root 任务已启动，请勿断开设备", parent=self, position=InfoBarPosition.TOP, isClosable=True)
+        self._clear_thread.start()
+
+    def _on_clear_root_finished(self, code):
+        self.btn_clear_root.setEnabled(True)
+        self.btn_clear_cancel.setEnabled(False)
+        self.btn_start.setEnabled(True)
+        try:
+            from app.services import log_service
+        except Exception:
+            log_service = None
+        if code == 0:
+            InfoBar.success("完成", "Root 权限已清除", parent=self, position=InfoBarPosition.TOP)
+            self._show_notification("恭喜你，ROOT 权限已成功清除！")
+            if log_service:
+                try:
+                    log_service.log_operation("清除Root", success=True)
+                except Exception:
+                    pass
+        elif code == -2:
+            InfoBar.info("已取消", "任务已取消", parent=self, position=InfoBarPosition.TOP, isClosable=True)
+        else:
+            InfoBar.error("失败", "清除 Root 遇到错误，请查看日志", parent=self, position=InfoBarPosition.TOP)
+            if log_service:
+                try:
+                    log_service.log_operation("清除Root", success=False, detail=f"code={code}")
+                except Exception:
+                    pass
+
+    def _on_clear_root_thread_finished(self):
+        self._clear_thread = None
+        self._clear_worker = None
+
+    def _cancel_clear_root(self):
+        try:
+            from app.services import log_service
+            log_service.log_ui_action("Root-取消清除Root")
+        except Exception:
+            pass
+        try:
+            if self._clear_worker:
+                self._clear_worker.stop()
+        except Exception:
+            pass
+        try:
+            if self._clear_thread and self._clear_thread.isRunning():
+                self._clear_thread.quit()
+                self._clear_thread.wait(100)
+        except Exception:
+            pass
+
     def _pick_boot(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择 boot 镜像", "", "镜像 (*.img);;所有文件 (*.*)")
         if path:
             self.edt_boot.setText(path)
+            try:
+                from app.services import log_service
+                log_service.log_file_event("选择", path)
+            except Exception:
+                pass
+
+    def _on_refresh_clicked(self):
+        try:
+            from app.services import log_service
+            log_service.log_ui_action("Root-刷新设备")
+        except Exception:
+            pass
+        self._refresh_device_info()
 
     def _refresh_device_info(self):
         if self._refreshing:
@@ -865,7 +1287,7 @@ class RootTab(QWidget):
             pass
 
         # 旧线程通过 finished -> deleteLater 自动清理，无需手动 cleanup
-        self._refresh_thread = _RootRefreshThread(self)
+        self._refresh_thread = _RootRefreshThread(serial=self._current_serial, parent=self)
         self._refresh_thread.result_ready.connect(self._on_refresh_info_finished)
         self._refresh_thread.finished.connect(self._refresh_thread.deleteLater)
         self._refresh_thread.start()
@@ -924,7 +1346,12 @@ class RootTab(QWidget):
     def _start_device_watcher(self):
         self._watch_timer = QTimer(self)
         self._watch_timer.timeout.connect(self._on_watch_tick)
-        self._watch_timer.start(2000)
+        try:
+            from app.components.hidden_settings import get_poll_interval
+            interval = get_poll_interval("root_watcher", 2000)
+        except Exception:
+            interval = 2000
+        self._watch_timer.start(interval)
         self._last_watch_state = ""
         self._watch_tick_thread = None
 
@@ -969,6 +1396,18 @@ class RootTab(QWidget):
             if getattr(self, '_watch_tick_thread', None) and self._watch_tick_thread.isRunning():
                 self._watch_tick_thread.quit()
                 self._watch_tick_thread.wait(100)
+        except Exception:
+            pass
+        # 清理清除 Root 线程
+        try:
+            if getattr(self, '_clear_worker', None):
+                try:
+                    self._clear_worker.stop()
+                except Exception:
+                    pass
+            if getattr(self, '_clear_thread', None) and self._clear_thread.isRunning():
+                self._clear_thread.quit()
+                self._clear_thread.wait(100)
         except Exception:
             pass
         # 兼容旧 _watch_worker 清理

@@ -1,18 +1,15 @@
 import os
-import subprocess
-import webbrowser
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
 
-from PySide6.QtCore import Qt, QTimer, QObject, QThread, Signal
+from PySide6.QtCore import Qt, QTimer, QThread, Signal
 
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QFileDialog, QGridLayout, QHBoxLayout,
+    QApplication, QFileDialog, QGridLayout, QHBoxLayout,
     QLabel, QTextEdit, QVBoxLayout, QWidget
 )
 from qfluentwidgets import (
-    CardWidget, ComboBox, FluentIcon, InfoBar, InfoBarPosition,
+    CardWidget, CheckBox, ComboBox, FluentIcon, InfoBar, InfoBarPosition,
     LineEdit, MessageBox, PrimaryPushButton, ProgressBar, PushButton,
     SmoothScrollArea, isDarkTheme, ThemeColor,
 )
@@ -21,15 +18,17 @@ from app.services import adb_service
 from app.logic import SideloadFlashLogic, MiFlashLogic
 from app.widgets.misc_tools.partition_flash_dialog import _PartitionFlashDialog
 from app.widgets.misc_tools.payload_extract_dialog import _PayloadExtractDialog
+from app.widgets.misc_tools.ops_extract_dialog import _OpsExtractDialog
 from app.widgets.misc_tools.workers import resolve_bin
 from app.components.blur_popup import show_blur_custom
+from app.components.glass_style import apply_banner_style, refresh_banner_style
 
 
 # ---------------------------------------------------------------------------
 # 设备状态监听器（后台线程）
 # ---------------------------------------------------------------------------
 class _DeviceWatcher(QThread):
-    """后台轮询设备变化（刷机中心）。
+    """后台轮询设备变化（Flash菜单）。
     使用 QThread 内置 finished 信号 + 实例变量传递结果，
     彻底避免 Cython 编译后自定义 Signal 的兼容性问题。"""
 
@@ -70,16 +69,23 @@ class _DeviceWatcher(QThread):
 
 
 class _FlashWatchTickThread(QThread):
-    """后台线程：执行轻量级设备状态检测（刷机中心专用）。"""
+    """后台线程：执行轻量级设备状态检测（Flash菜单专用）。"""
 
-    def __init__(self, parent=None):
+    def __init__(self, target_serial: str = "", parent=None):
         super().__init__(parent)
         self._state = None
+        self._target_serial = str(target_serial or "")
 
     def run(self):
         try:
             from app.services import adb_service
-            mode, serial = adb_service.detect_connection_mode()
+            # 优先检测指定 serial 的设备状态，避免多设备时取到错误设备
+            if self._target_serial:
+                summary = adb_service.connection_summary(serial=self._target_serial)
+                mode = summary.get("mode", "") or "none"
+                serial = summary.get("serial", "") or self._target_serial
+            else:
+                mode, serial = adb_service.detect_connection_mode()
             self._state = f"{mode}:{serial}"
         except Exception:
             self._state = None
@@ -93,11 +99,10 @@ class _FlashWorker(QThread):
     result_ready = Signal(bool, str)
     progress_signal = Signal(int, int, int)
 
-    def __init__(self, mode: int, path: str, config_path: Optional[str] = None, parent_tab=None, parent=None):
+    def __init__(self, mode: int, path: str, parent_tab=None, parent=None):
         super().__init__(parent)
         self.mode = mode
         self.path = path
-        self.config_path = config_path
         self.parent_tab = parent_tab
         self._cancelled = False
 
@@ -107,44 +112,11 @@ class _FlashWorker(QThread):
     def run(self):
         try:
             if self.mode == 0:
-                self._flash_scattered()
-            elif self.mode == 1:
                 self._flash_sideload()
-            elif self.mode == 2:
+            elif self.mode == 1:
                 self._flash_miflash()
         except Exception as e:
             self.log_signal.emit(f"刷机异常: {e}")
-            self.result_ready.emit(False, str(e))
-
-    def _flash_scattered(self):
-        if not self.parent_tab:
-            self.result_ready.emit(False, "内部错误：无法访问刷机逻辑")
-            return
-        self.log_signal.emit("散包刷机模式启动...")
-        try:
-            images = self.parent_tab._scan_images(self.path)
-            count = len(images)
-            self.log_signal.emit(f"镜像目录: {self.path}")
-            self.log_signal.emit(f"扫描到 {count} 个镜像文件")
-            if count == 0:
-                self.result_ready.emit(False, "未找到任何 .img 镜像文件")
-                return
-            if not self.config_path:
-                self.result_ready.emit(False, "未选择配置文件")
-                return
-            self.log_signal.emit(f"加载配置: {self.config_path}")
-            plan = self.parent_tab._parse_config(Path(self.config_path))
-            if not plan:
-                self.result_ready.emit(False, "配置文件解析失败")
-                return
-            self.log_signal.emit(f"配置解析成功: 设备={','.join(plan.get('devices') or [])}, 步骤数={len(plan['steps'])}")
-            self.parent_tab._run_flash_plan_in_thread(
-                plan, self.path, self.log_signal.emit,
-                progress_callback=lambda c, t, p: self.progress_signal.emit(c, t, p)
-            )
-            self.result_ready.emit(True, "散包刷机完成")
-        except Exception as e:
-            self.log_signal.emit(f"散包刷机异常: {e}")
             self.result_ready.emit(False, str(e))
 
     def _flash_sideload(self):
@@ -194,7 +166,7 @@ class _FlashWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
-# 刷机中心 Tab
+# Flash菜单 Tab
 # ---------------------------------------------------------------------------
 class FlashCenterTab(QWidget):
     log_signal = Signal(str)
@@ -202,13 +174,10 @@ class FlashCenterTab(QWidget):
     def __init__(self):
         super().__init__()
         self._source_path: str = ""
-        self._config_path: Optional[Path] = None
-        self._images_dir: Optional[Path] = None
-        self._images: Dict[str, Path] = {}
-        self._watcher_worker = None
         self._watcher_worker = None
         self._flash_worker = None
-        self._flash_worker = None
+        # 当前仪表盘选中的设备 serial（多设备协同）
+        self._current_serial = ""
 
         # 解析 adb/fastboot 路径
         adb_bin = getattr(adb_service, 'ADB_BIN', None)
@@ -238,12 +207,12 @@ class FlashCenterTab(QWidget):
         outer.addWidget(scroll)
 
         container = QWidget()
-        container.setStyleSheet("QWidget {background: transparent;}")
+        container.setStyleSheet("background: transparent;")
         scroll.setWidget(container)
 
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(18)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(24)
 
         # ---- Banner ----
         self._build_banner(layout)
@@ -268,21 +237,24 @@ class FlashCenterTab(QWidget):
 
     def _build_banner(self, layout):
         banner_w = QWidget(self)
-        banner_w.setFixedHeight(90)
-        banner_w.setStyleSheet("background: transparent;")
+        self.banner_w = banner_w
         try:
-            banner_w.setAttribute(Qt.WA_TranslucentBackground, True)
+            banner_w.setProperty("banner", "true")
+            banner_w.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         except Exception:
             pass
+        banner_w.setFixedHeight(110)
+        apply_banner_style(banner_w)
 
         banner = QHBoxLayout(banner_w)
-        banner.setContentsMargins(24, 12, 24, 12)
+        banner.setContentsMargins(20, 20, 20, 20)
         banner.setSpacing(16)
 
         icon_lbl = QLabel("", banner_w)
         icon_lbl.setStyleSheet("background: transparent;")
         icon_lbl.setFixedSize(48, 48)
         icon_lbl.setAlignment(Qt.AlignCenter)
+        icon_lbl._fluent_icon = FluentIcon.SPEED_HIGH
         try:
             _ico = FluentIcon.SPEED_HIGH.icon(ThemeColor.LIGHT_1 if isDarkTheme() else ThemeColor.DARK_1)
             icon_lbl.setPixmap(_ico.pixmap(48, 48))
@@ -292,9 +264,9 @@ class FlashCenterTab(QWidget):
         title_col = QVBoxLayout()
         title_col.setContentsMargins(0, 0, 0, 0)
         title_col.setSpacing(2)
-        title = QLabel("刷机中心", banner_w)
+        title = QLabel("Flash菜单", banner_w)
         title.setStyleSheet("font-size: 22px; font-weight: 600;")
-        sub = QLabel("智能一键刷机 · 分区刷入 · Payload 处理", banner_w)
+        sub = QLabel("智能一键刷写 · 分区刷入 · 固件提取", banner_w)
         sub.setStyleSheet("font-size: 13px;")
         title_col.addWidget(title)
         title_col.addWidget(sub)
@@ -314,7 +286,7 @@ class FlashCenterTab(QWidget):
         h_title.setSpacing(8)
         icon = QLabel("📦")
         icon.setStyleSheet("font-size:16px;")
-        title = QLabel("刷机模式")
+        title = QLabel("刷写模式")
         title.setStyleSheet("font-size:15px; font-weight:600;")
         h_title.addWidget(icon)
         h_title.addWidget(title)
@@ -325,34 +297,24 @@ class FlashCenterTab(QWidget):
         src_row = QHBoxLayout()
         src_row.setSpacing(10)
         self.combo_mode = ComboBox()
-        self.combo_mode.addItems(["散包刷机（文件夹）", "ADB Sideload", "小米线刷脚本"])
+        self.combo_mode.addItems(["ADB Sideload", "小米线刷脚本"])
         self.combo_mode.currentIndexChanged.connect(self._on_mode_changed)
 
         self.path_edit = LineEdit()
         self.path_edit.setReadOnly(True)
-        self.path_edit.setPlaceholderText("选择刷机包文件夹路径")
+        self.path_edit.setPlaceholderText("选择 OTA 升级包 (.zip)")
         try:
             self.path_edit.setClearButtonEnabled(False)
         except Exception:
             pass
 
-        self.btn_pick = PushButton("选择目录")
+        self.btn_pick = PushButton("选择文件")
         self.btn_pick.clicked.connect(self._pick_source)
-
-        self.config_edit = LineEdit()
-        self.config_edit.setReadOnly(True)
-        self.config_edit.setPlaceholderText("选择刷机配置脚本 (.txt)")
-        self.btn_pick_config = PushButton("选择配置")
-        self.btn_pick_config.clicked.connect(self._pick_config)
 
         src_row.addWidget(QLabel("模式:"))
         src_row.addWidget(self.combo_mode, 1)
         src_row.addWidget(self.path_edit, 3)
         src_row.addWidget(self.btn_pick)
-        src_row.addSpacing(12)
-        src_row.addWidget(QLabel("配置:"))
-        src_row.addWidget(self.config_edit, 2)
-        src_row.addWidget(self.btn_pick_config)
         v.addLayout(src_row)
 
         layout.addWidget(card)
@@ -377,16 +339,32 @@ class FlashCenterTab(QWidget):
         status_row = QHBoxLayout()
         self.status_conn = QLabel("设备：未连接")
         self.status_mode = QLabel("模式：未知")
+        self.status_serial = QLabel("序列号：-")
+        self.status_serial.setStyleSheet("font-size:13px; color:#808080;")
         self.refresh_btn = PushButton("刷新状态")
-        self.refresh_btn.clicked.connect(self.refresh_status)
+        self.refresh_btn.clicked.connect(self._on_refresh_status_clicked)
         status_row.addWidget(self.status_conn)
         status_row.addSpacing(16)
         status_row.addWidget(self.status_mode)
+        status_row.addSpacing(16)
+        status_row.addWidget(self.status_serial)
         status_row.addStretch(1)
         status_row.addWidget(self.refresh_btn)
         v.addLayout(status_row)
 
         layout.addWidget(card)
+
+    def set_current_serial(self, serial: str):
+        """接收仪表盘广播的设备 serial，刷新设备状态显示。"""
+        new_serial = str(serial or "").strip()
+        if new_serial == self._current_serial:
+            return
+        self._current_serial = new_serial
+        # 切换设备后立即刷新状态卡片
+        try:
+            self.refresh_status()
+        except Exception:
+            pass
 
     def _build_options_and_tools(self, layout):
         grid = QGridLayout()
@@ -402,16 +380,17 @@ class FlashCenterTab(QWidget):
         h_opt.setSpacing(8)
         h_opt_icon = QLabel("⚙️")
         h_opt_icon.setStyleSheet("font-size:16px;")
-        h_opt_title = QLabel("刷机选项")
+        h_opt_title = QLabel("刷写设置")
         h_opt_title.setStyleSheet("font-size:15px; font-weight:600;")
         h_opt.addWidget(h_opt_icon)
         h_opt.addWidget(h_opt_title)
         h_opt.addStretch(1)
         v_opt.addLayout(h_opt)
 
-        self.wipe_check = QCheckBox("清除数据（出厂重置）")
+        # 使用 qfluentwidgets CheckBox：自动显示对号、跟随主题色、毛玻璃透明
+        self.wipe_check = CheckBox("清除数据（出厂重置）")
         self.wipe_check.setChecked(False)
-        self.keep_root_check = QCheckBox("保留 ROOT 权限")
+        self.keep_root_check = CheckBox("保留 ROOT 权限")
         try:
             self.keep_root_check.setToolTip("勾选此项将跳过刷入 boot.img")
         except Exception:
@@ -438,7 +417,7 @@ class FlashCenterTab(QWidget):
         v_part.addLayout(h_part)
 
         part_desc = QLabel("选择镜像并刷入指定分区\n（可选槽位 / 模式）")
-        part_desc.setStyleSheet("font-size:12px; color:#808080;")
+        part_desc.setStyleSheet("font-size:12px;")
         part_desc.setWordWrap(True)
         v_part.addWidget(part_desc)
 
@@ -448,32 +427,36 @@ class FlashCenterTab(QWidget):
         v_part.addStretch(1)
         grid.addWidget(card_part, 0, 1)
 
-        # 右列：Payload 处理
-        card_pay = CardWidget(self)
-        v_pay = QVBoxLayout(card_pay)
-        v_pay.setContentsMargins(16, 12, 16, 14)
-        v_pay.setSpacing(10)
-        h_pay = QHBoxLayout()
-        h_pay.setSpacing(8)
-        h_pay_icon = QLabel("🧩")
-        h_pay_icon.setStyleSheet("font-size:16px;")
-        h_pay_title = QLabel("Payload 处理")
-        h_pay_title.setStyleSheet("font-size:15px; font-weight:600;")
-        h_pay.addWidget(h_pay_icon)
-        h_pay.addWidget(h_pay_title)
-        h_pay.addStretch(1)
-        v_pay.addLayout(h_pay)
+        # 右列：固件提取（包含 Payload.bin 和 OPS 解包）
+        card_fw = CardWidget(self)
+        v_fw = QVBoxLayout(card_fw)
+        v_fw.setContentsMargins(16, 12, 16, 14)
+        v_fw.setSpacing(10)
+        h_fw = QHBoxLayout()
+        h_fw.setSpacing(8)
+        h_fw_icon = QLabel("📦")
+        h_fw_icon.setStyleSheet("font-size:16px;")
+        h_fw_title = QLabel("固件提取")
+        h_fw_title.setStyleSheet("font-size:15px; font-weight:600;")
+        h_fw.addWidget(h_fw_icon)
+        h_fw.addWidget(h_fw_title)
+        h_fw.addStretch(1)
+        v_fw.addLayout(h_fw)
 
-        pay_desc = QLabel("提取 payload.bin 镜像\n支持全量和指定分区")
-        pay_desc.setStyleSheet("font-size:12px; color:#808080;")
-        pay_desc.setWordWrap(True)
-        v_pay.addWidget(pay_desc)
+        fw_desc = QLabel("Payload.bin / OPS 固件解包\n支持全量和指定分区")
+        fw_desc.setStyleSheet("font-size:12px;")
+        fw_desc.setWordWrap(True)
+        v_fw.addWidget(fw_desc)
 
-        self.btn_payload = PushButton("打开 Payload 处理")
+        self.btn_payload = PushButton("打开 Payload 解包")
         self.btn_payload.clicked.connect(self._open_payload_extract)
-        v_pay.addWidget(self.btn_payload)
-        v_pay.addStretch(1)
-        grid.addWidget(card_pay, 0, 2)
+        v_fw.addWidget(self.btn_payload)
+
+        self.btn_ops = PushButton("打开 OPS 解包")
+        self.btn_ops.clicked.connect(self._open_ops_extract)
+        v_fw.addWidget(self.btn_ops)
+        v_fw.addStretch(1)
+        grid.addWidget(card_fw, 0, 2)
 
         layout.addLayout(grid)
 
@@ -496,16 +479,13 @@ class FlashCenterTab(QWidget):
 
         run_row = QHBoxLayout()
         run_row.setSpacing(10)
-        self.run_btn = PrimaryPushButton("开始刷机")
-        self.cancel_btn = PushButton("取消刷机")
+        self.run_btn = PrimaryPushButton("开始刷写")
+        self.cancel_btn = PushButton("取消刷写")
         self.save_log_btn = PushButton("清空日志窗口")
-        self.btn_cfg_repo = PushButton("配置文件仓库")
-        self.btn_cfg_repo.clicked.connect(self._open_cfg_repo)
         run_row.addWidget(self.run_btn)
         run_row.addWidget(self.cancel_btn)
         run_row.addWidget(self.save_log_btn)
         run_row.addStretch(1)
-        run_row.addWidget(self.btn_cfg_repo)
         v.addLayout(run_row)
 
         self.run_btn.clicked.connect(self.start_flash)
@@ -524,7 +504,7 @@ class FlashCenterTab(QWidget):
         h_title.setSpacing(8)
         icon = QLabel("📝")
         icon.setStyleSheet("font-size:16px;")
-        title = QLabel("刷机日志")
+        title = QLabel("执行日志")
         title.setStyleSheet("font-size:15px; font-weight:600;")
         h_title.addWidget(icon)
         h_title.addWidget(title)
@@ -533,21 +513,14 @@ class FlashCenterTab(QWidget):
 
         self.log = QTextEdit()
         self.log.setReadOnly(True)
+        self.log.setContextMenuPolicy(Qt.NoContextMenu)
         self.log.setMinimumHeight(200)
         try:
             self.log.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
             self.log.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-            try:
-                from qfluentwidgets import isDarkTheme
-                dark = isDarkTheme()
-            except Exception:
-                dark = False
-            if dark:
-                self.log.setStyleSheet("background: transparent;")
-            else:
-                self.log.setStyleSheet("background-color: #F5F3FF; color: #1f2329; border: 1px solid #DDD6FE; border-radius: 8px; padding: 10px;")
         except Exception:
             pass
+        self._refresh_log_theme()
         log_view = SmoothScrollArea(self)
         log_view.setWidget(self.log)
         log_view.setWidgetResizable(True)
@@ -578,48 +551,45 @@ class FlashCenterTab(QWidget):
     # ---- 模式切换 ----
     def _on_mode_changed(self, index: int):
         if index == 0:
-            self.path_edit.setPlaceholderText("选择刷机包文件夹路径")
-            self.btn_pick.setText("选择目录")
-        elif index == 1:
             self.path_edit.setPlaceholderText("选择 OTA 升级包 (.zip)")
             self.btn_pick.setText("选择文件")
-        elif index == 2:
+        elif index == 1:
             self.path_edit.setPlaceholderText("选择线刷包目录（包含 flash_all.bat）")
             self.btn_pick.setText("选择目录")
         self.path_edit.clear()
         self._source_path = ""
+        try:
+            from app.services import log_service
+            mode_name = self.combo_mode.currentText() if hasattr(self, 'combo_mode') else f"模式{index}"
+            log_service.log_ui_action("Flash菜单-切换刷写模式", mode_name)
+        except Exception:
+            pass
 
     def _pick_source(self):
         mode = self.combo_mode.currentIndex()
         if mode == 0:
-            path = QFileDialog.getExistingDirectory(self, "选择刷机包目录")
-        elif mode == 1:
             path, _ = QFileDialog.getOpenFileName(self, "选择 OTA 包", "", "OTA 包 (*.zip);;All (*.*)")
-        elif mode == 2:
+        elif mode == 1:
             path = QFileDialog.getExistingDirectory(self, "选择小米线刷包目录")
         if path:
             self._source_path = path
             self.path_edit.setText(path)
-
-    def _pick_config(self):
-        path, _ = QFileDialog.getOpenFileName(self, "选择刷机配置脚本", "", "配置脚本 (*.txt);;所有文件 (*.*)")
-        if path:
-            self._config_path = Path(path)
-            self.config_edit.setText(path)
-            self.append_log(f"已选择配置文件: {path}")
-
-    def _open_cfg_repo(self):
-        url = "https://gitee.com/gyah/Tobatools-config-file"
-        try:
-            webbrowser.open(url)
-        except Exception:
-            self._toast_warning("打开失败", "无法打开链接，请手动复制到浏览器访问")
+            try:
+                from app.services import log_service
+                log_service.log_file_event("选择", path)
+            except Exception:
+                pass
 
     # ---- 设备监听 ----
     def _start_device_watcher(self):
         self._watch_timer = QTimer(self)
         self._watch_timer.timeout.connect(self._on_watch_tick)
-        self._watch_timer.start(3000)
+        try:
+            from app.components.hidden_settings import get_poll_interval
+            interval = get_poll_interval("flash_watcher", 3000)
+        except Exception:
+            interval = 3000
+        self._watch_timer.start(interval)
         self._last_watch_state = ""
         self._watch_tick_thread = None
 
@@ -634,7 +604,7 @@ class FlashCenterTab(QWidget):
                 old.finished.disconnect(self._on_watch_tick_finished)
             except Exception:
                 pass
-        self._watch_tick_thread = _FlashWatchTickThread(self)
+        self._watch_tick_thread = _FlashWatchTickThread(self._current_serial, self)
         self._watch_tick_thread.finished.connect(self._on_watch_tick_finished, Qt.QueuedConnection)
         self._watch_tick_thread.start()
 
@@ -675,13 +645,34 @@ class FlashCenterTab(QWidget):
                 pass
             self._watcher_worker = None
 
+    def _on_refresh_status_clicked(self):
+        try:
+            from app.services import log_service
+            log_service.log_ui_action("Flash菜单-刷新状态")
+        except Exception:
+            pass
+        self.refresh_status()
+
     def refresh_status(self):
-        summary = adb_service.connection_summary()
+        summary = adb_service.connection_summary(serial=self._current_serial)
         self.status_conn.setText(summary.get("status_conn", "设备：未连接"))
         self.status_mode.setText(summary.get("status_mode", "模式：未知"))
+        # 显示当前选中设备的序列号
+        try:
+            cur_serial = str(summary.get("serial", "") or "").strip()
+            if not cur_serial and self._current_serial:
+                cur_serial = self._current_serial
+            self.status_serial.setText(f"序列号：{cur_serial or '-'}")
+        except Exception:
+            pass
 
     # ---- 刷机主流程 ----
     def start_flash(self):
+        try:
+            from app.services import log_service
+            log_service.log_ui_action("Flash菜单-开始刷写", self.combo_mode.currentText())
+        except Exception:
+            pass
         if self._flash_worker and self._flash_worker.isRunning():
             self._toast_warning("提示", "刷机正在进行中...")
             return
@@ -692,34 +683,25 @@ class FlashCenterTab(QWidget):
             self._toast_warning("提示", "请先选择文件或目录。")
             return
 
-        if mode in [0, 2]:
-            if not os.path.isdir(path):
-                self._toast_warning("提示", "选择的路径不是有效的文件夹。")
-                return
-        elif mode == 1:
+        if mode == 0:
             if not os.path.isfile(path):
                 self._toast_warning("提示", "选择的路径不是有效的文件。")
                 return
-
-        config_path = None
-        if mode == 0:
-            if not self._config_path:
-                self._toast_warning("提示", "请先选择刷机配置文件！")
+        elif mode == 1:
+            if not os.path.isdir(path):
+                self._toast_warning("提示", "选择的路径不是有效的文件夹。")
                 return
-            config_path = str(self._config_path)
 
-        # 设备模式检查
-        if mode == 0:
-            device_mode, serial = adb_service.detect_connection_mode()
-            if device_mode not in ['bootloader', 'fastbootd']:
-                self._toast_warning(
-                    "提示",
-                    "设备不在 Bootloader/Fastbootd 模式，无法开始刷机\n请先重启到 fastboot / fastbootd"
-                )
-                return
-        elif mode == 2:
+        # 设备模式检查（小米线刷）
+        if mode == 1:
             try:
-                device_mode, serial = adb_service.detect_connection_mode()
+                # 优先使用仪表盘选中的设备
+                if self._current_serial:
+                    summary = adb_service.connection_summary(serial=self._current_serial)
+                    device_mode = summary.get("mode", "")
+                    serial = self._current_serial
+                else:
+                    device_mode, serial = adb_service.detect_connection_mode()
                 if device_mode not in ['bootloader', 'fastbootd']:
                     self._toast_warning(
                         "提示",
@@ -728,17 +710,16 @@ class FlashCenterTab(QWidget):
             except Exception:
                 pass
 
-        mode_names = ["散包刷机", "ADB Sideload", "小米线刷脚本"]
+        mode_names = ["ADB Sideload", "小米线刷脚本"]
         msg_box = MessageBox(
             "确认刷机",
             f"即将开始 {mode_names[mode]}，请确认：\n\n"
             f"📁 路径：{path}\n"
-            f"{f'📄 配置：{config_path}' if config_path else ''}"
             f"\n\n⚠️ 刷机有风险，请确保已备份重要数据！\n"
             f"是否继续？",
             self
         )
-        msg_box.yesButton.setText("开始刷机")
+        msg_box.yesButton.setText("开始刷写")
         msg_box.cancelButton.setText("取消")
         if show_blur_custom(self.window(), msg_box) != MessageBox.Accepted:
             return
@@ -746,7 +727,7 @@ class FlashCenterTab(QWidget):
         self.log.clear()
         self._set_controls_enabled(False)
 
-        self._flash_worker = _FlashWorker(mode, path, config_path, parent_tab=self, parent=self)
+        self._flash_worker = _FlashWorker(mode, path, parent_tab=self, parent=self)
 
         if self._watcher_worker:
             self._watcher_worker.pause()
@@ -767,8 +748,6 @@ class FlashCenterTab(QWidget):
         self.combo_mode.setEnabled(enabled)
         self.path_edit.setEnabled(enabled)
         self.btn_pick.setEnabled(enabled)
-        self.btn_pick_config.setEnabled(enabled)
-        self.config_edit.setEnabled(enabled)
 
     def _on_progress_update(self, current_step: int, total_steps: int, percentage: int):
         self.progress_bar.setValue(percentage)
@@ -784,16 +763,30 @@ class FlashCenterTab(QWidget):
             self._flash_worker.wait(100)
             self._flash_worker.deleteLater()
             self._flash_worker = None
-            self._flash_worker = None
         self._set_controls_enabled(True)
         if success:
             self.append_log(f"\n✅ {message}")
             self._toast_success("成功", message)
+            try:
+                from app.services import log_service
+                log_service.log_operation("刷机", success=True, detail=message)
+            except Exception:
+                pass
         else:
             self.append_log(f"\n❌ {message}")
             self._toast_warning("失败", message)
+            try:
+                from app.services import log_service
+                log_service.log_operation("刷机", success=False, detail=message)
+            except Exception:
+                pass
 
     def cancel(self):
+        try:
+            from app.services import log_service
+            log_service.log_ui_action("Flash菜单-取消任务")
+        except Exception:
+            pass
         try:
             self._set_controls_enabled(True)
         except Exception:
@@ -801,6 +794,11 @@ class FlashCenterTab(QWidget):
         self.append_log("已请求取消当前任务")
 
     def clear_log(self):
+        try:
+            from app.services import log_service
+            log_service.log_ui_action("Flash菜单-清空日志窗口")
+        except Exception:
+            pass
         self.log.clear()
         self._toast_info("提示", "日志窗口已清空")
 
@@ -815,9 +813,21 @@ class FlashCenterTab(QWidget):
         except Exception:
             dark = False
         if dark:
-            self.log.setStyleSheet("background: transparent; color: #E6E1E5;")
+            self.log.setStyleSheet(
+                "background-color: rgba(30, 30, 35, 0.50); color: #E6E1E5; "
+                "border: 1px solid rgba(255, 255, 255, 0.06); border-radius: 8px; padding: 10px;"
+            )
         else:
-            self.log.setStyleSheet("background-color: #F5F3FF; color: #1f2329; border: 1px solid #DDD6FE; border-radius: 8px; padding: 10px;")
+            self.log.setStyleSheet(
+                "background-color: rgba(255, 255, 255, 0.55); color: #1f2329; "
+                "border: 1px solid rgba(42, 116, 218, 0.12); border-radius: 8px; padding: 10px;"
+            )
+
+    def refresh_theme(self):
+        """主题切换时刷新所有主题依赖的样式。"""
+        self._refresh_log_theme()
+        if hasattr(self, 'banner_w'):
+            refresh_banner_style(self.banner_w)
 
     def cleanup(self):
         self._stop_device_watcher()
@@ -839,15 +849,39 @@ class FlashCenterTab(QWidget):
         return super().closeEvent(event)
 
     def append_log(self, text: str):
+        try:
+            from app.services import log_service
+            log_service.get_logger("OPS").info(str(text))
+        except Exception:
+            pass
         self.log_signal.emit(text)
 
     # ---- 分区刷入 / Payload 处理 ----
     def _open_partition_flash(self):
+        try:
+            from app.services import log_service
+            log_service.log_ui_action("Flash菜单-单分区刷入")
+        except Exception:
+            pass
         dlg = _PartitionFlashDialog(self.fastboot_path, self)
         show_blur_custom(self.window(), dlg)
 
     def _open_payload_extract(self):
+        try:
+            from app.services import log_service
+            log_service.log_ui_action("Flash菜单-Payload提取")
+        except Exception:
+            pass
         dlg = _PayloadExtractDialog(self)
+        show_blur_custom(self.window(), dlg)
+
+    def _open_ops_extract(self):
+        try:
+            from app.services import log_service
+            log_service.log_ui_action("Flash菜单-OPS解包")
+        except Exception:
+            pass
+        dlg = _OpsExtractDialog(self)
         show_blur_custom(self.window(), dlg)
 
     # ---- Toast 辅助 ----
@@ -862,299 +896,3 @@ class FlashCenterTab(QWidget):
 
     def _toast_info(self, title: str, content: str, ms: int = 2500):
         InfoBar.info(title, content, parent=self, position=InfoBarPosition.TOP, duration=ms, isClosable=True)
-
-    # ---- 子进程辅助 ----
-    def _popen_kwargs_silent(self) -> dict:
-        if os.name == 'nt':
-            si = subprocess.STARTUPINFO()
-            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            return {'startupinfo': si, 'creationflags': subprocess.CREATE_NO_WINDOW}
-        return {}
-
-    def _resolve_fastboot(self) -> str:
-        fb = adb_service.FASTBOOT_BIN
-        if fb and fb.exists():
-            return str(fb)
-        return self.fastboot_path or 'fastboot'
-
-    def _run_fastboot(self, args: List[str], desc: str = "") -> tuple:
-        fb = self._resolve_fastboot()
-        cmd = [fb] + args
-        try:
-            if desc:
-                self.append_log(f"执行: {desc}")
-            result = subprocess.run(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding='utf-8', errors='replace', timeout=120,
-                **self._popen_kwargs_silent()
-            )
-            output = result.stdout.strip()
-            if output:
-                for line in output.split('\n'):
-                    if line.strip():
-                        self.append_log(line.strip())
-            return result.returncode == 0, output
-        except subprocess.TimeoutExpired:
-            self.append_log(f"超时: {desc}")
-            return False, ""
-        except Exception as e:
-            self.append_log(f"执行失败: {e}")
-            return False, ""
-
-    # ---- 散包刷机核心逻辑 ----
-    def _scan_images(self, folder: str) -> Dict[str, Path]:
-        images: Dict[str, Path] = {}
-        try:
-            for p in Path(folder).glob('*.img'):
-                images[p.name.lower()] = p
-        except Exception:
-            pass
-        return images
-
-    def _parse_config(self, config_path: Path) -> Optional[dict]:
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-            devices: List[str] = []
-            steps = []
-            current_mode = None
-            for line in lines:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                if line.startswith('device:'):
-                    v = line.split(':', 1)[1].strip()
-                    if v:
-                        devices.append(v)
-                    continue
-                if line == 'bootloader':
-                    current_mode = 'bootloader'
-                    steps.append({'type': 'mode', 'mode': 'bootloader'})
-                    continue
-                if line == 'fastbootd':
-                    current_mode = 'fastbootd'
-                    steps.append({'type': 'mode', 'mode': 'fastbootd'})
-                    continue
-                if line == 'system':
-                    steps.append({'type': 'reboot', 'target': 'system'})
-                    continue
-                if line == 'set-a':
-                    steps.append({'type': 'set_slot', 'slot': 'a'})
-                    continue
-                if line == 'set-b':
-                    steps.append({'type': 'set_slot', 'slot': 'b'})
-                    continue
-                if line == 'wipe-data':
-                    continue
-                if line.startswith('-'):
-                    line = line[1:]
-                    parts = line.split()
-                    if not parts:
-                        continue
-                    partition = parts[0]
-                    if len(parts) > 1:
-                        if parts[1] == 'disable':
-                            steps.append({'type': 'flash', 'partition': partition, 'disable_avb': True, 'mode': current_mode})
-                        elif parts[1] == 'del':
-                            steps.append({'type': 'delete_logical', 'partition': partition, 'mode': current_mode})
-                        elif parts[1] == 'add' and len(parts) > 2:
-                            steps.append({'type': 'create_logical', 'partition': partition, 'size': parts[2], 'mode': current_mode})
-                    else:
-                        steps.append({'type': 'flash', 'partition': partition, 'disable_avb': False, 'mode': current_mode})
-            if not devices:
-                self.append_log("错误: 配置文件缺少 device: 字段")
-                return None
-            return {'devices': devices, 'steps': steps}
-        except Exception as e:
-            self.append_log(f"解析配置文件失败: {e}")
-            return None
-
-    def _run_flash_plan_in_thread(self, plan: dict, images_dir: str, log_func, progress_callback=None):
-        self._images_dir = Path(images_dir)
-        self._images = self._scan_images(images_dir)
-        log_func("=" * 50)
-        log_func("开始执行刷机计划")
-        log_func("=" * 50)
-        total_steps = len(plan['steps'])
-
-        fb = self._resolve_fastboot()
-        try:
-            result = subprocess.run(
-                [fb, 'getvar', 'product'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, timeout=5, **self._popen_kwargs_silent()
-            )
-            output = result.stdout.lower()
-            device_product = ""
-            for line in output.split('\n'):
-                if 'product:' in line:
-                    device_product = line.split(':', 1)[-1].strip()
-                    break
-            expected_devices = [d.strip() for d in (plan.get('devices') or []) if d and d.strip()]
-            if not expected_devices:
-                raise Exception("配置文件缺少 device: 字段")
-            ok = any(d.lower() in device_product for d in expected_devices)
-            if not ok:
-                raise Exception(f"设备型号不匹配：期望任一 {expected_devices}, 实际 {device_product}")
-            log_func(f"设备验证成功: {device_product} (命中: {expected_devices})")
-        except Exception as e:
-            log_func(f"❌ 设备验证失败: {e}")
-            raise
-
-        for i, step in enumerate(plan['steps'], 1):
-            step_type = step['type']
-            if progress_callback:
-                percentage = int((i / total_steps) * 100)
-                progress_callback(i, total_steps, percentage)
-
-            if step_type == 'mode':
-                target_mode = step['mode']
-                log_func(f"切换到 {target_mode} 模式")
-                try:
-                    result = subprocess.run(
-                        [fb, 'getvar', 'is-userspace'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, timeout=5, **self._popen_kwargs_silent()
-                    )
-                    current_mode = 'fastbootd' if 'yes' in result.stdout.lower() else 'bootloader'
-                except Exception:
-                    current_mode = 'unknown'
-                if current_mode == target_mode:
-                    log_func(f"  已在 {target_mode} 模式")
-                    continue
-                if target_mode == 'fastbootd':
-                    log_func("  正在重启到 fastbootd...")
-                    try:
-                        subprocess.run([fb, 'reboot', 'fastboot'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                       timeout=10, **self._popen_kwargs_silent())
-                    except subprocess.TimeoutExpired:
-                        log_func("  设备正在重启...")
-                    except Exception as e:
-                        log_func(f"  重启命令执行异常: {e}")
-                    wait_seconds = 15
-                    for remaining in range(wait_seconds, 0, -1):
-                        log_func(f"  等待设备重启... {remaining} 秒")
-                        time.sleep(1)
-                    log_func("  ✅ 已切换到 fastbootd 模式")
-                elif target_mode == 'bootloader':
-                    log_func("  正在重启到 bootloader...")
-                    try:
-                        subprocess.run([fb, 'reboot-bootloader'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                       timeout=10, **self._popen_kwargs_silent())
-                    except subprocess.TimeoutExpired:
-                        log_func("  设备正在重启...")
-                    except Exception as e:
-                        log_func(f"  重启命令执行异常: {e}")
-                    wait_seconds = 10
-                    for remaining in range(wait_seconds, 0, -1):
-                        log_func(f"  等待设备重启... {remaining} 秒")
-                        time.sleep(1)
-                    log_func("  ✅ 已切换到 bootloader 模式")
-
-            elif step_type == 'flash':
-                partition = step['partition']
-                disable_avb = step.get('disable_avb', False)
-                log_func(f"刷写 {partition}")
-
-                if partition.endswith('_ab'):
-                    is_ab = True
-                    base_partition = partition[:-3]
-                elif partition.endswith('_a') or partition.endswith('_b'):
-                    is_ab = False
-                    base_partition = partition[:-2]
-                else:
-                    is_ab = False
-                    base_partition = partition
-
-                img_name = f"{base_partition}.img"
-                img_path = self._images.get(img_name.lower())
-                if not img_path:
-                    log_func(f"警告: 未找到 {img_name}，跳过")
-                    continue
-
-                if is_ab:
-                    for slot in ['a', 'b']:
-                        slot_partition = f"{base_partition}_{slot}"
-                        cmd = [fb, 'flash', slot_partition, str(img_path)]
-                        if disable_avb:
-                            cmd.extend(['--disable-verity', '--disable-verification'])
-                        try:
-                            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                                    text=True, timeout=120, **self._popen_kwargs_silent())
-                            out = result.stdout.strip()
-                            if out:
-                                for line in out.split('\n'):
-                                    if line.strip():
-                                        log_func(line.strip())
-                            if result.returncode != 0:
-                                raise Exception(f"刷写 {slot_partition} 失败")
-                        except Exception as e:
-                            log_func(f"❌ {e}")
-                            raise
-                else:
-                    cmd = [fb, 'flash', partition, str(img_path)]
-                    if disable_avb:
-                        cmd.extend(['--disable-verity', '--disable-verification'])
-                    try:
-                        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                                text=True, timeout=120, **self._popen_kwargs_silent())
-                        out = result.stdout.strip()
-                        if out:
-                            for line in out.split('\n'):
-                                if line.strip():
-                                    log_func(line.strip())
-                        if result.returncode != 0:
-                            raise Exception(f"刷写 {partition} 失败")
-                    except Exception as e:
-                        log_func(f"❌ {e}")
-                        raise
-
-            elif step_type == 'delete_logical':
-                partition = step['partition']
-                targets = [partition, f"{partition}_a", f"{partition}_b", f"{partition}_a-cow", f"{partition}_b-cow"]
-                log_func(f"删除逻辑分区: {partition}")
-                for target in targets:
-                    try:
-                        result = subprocess.run(
-                            [fb, 'delete-logical-partition', target],
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, timeout=30, **self._popen_kwargs_silent()
-                        )
-                        out = result.stdout.strip()
-                        if out and ('not find' not in out.lower() and 'not exist' not in out.lower()):
-                            log_func(out)
-                    except Exception:
-                        pass
-
-            elif step_type == 'create_logical':
-                partition = step['partition']
-                size = step['size']
-                log_func(f"创建逻辑分区: {partition} ({size})")
-                try:
-                    result = subprocess.run(
-                        [fb, 'create-logical-partition', partition, size],
-                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, timeout=30, **self._popen_kwargs_silent()
-                    )
-                    out = result.stdout.strip()
-                    if out:
-                        log_func(out)
-                    if result.returncode != 0:
-                        raise Exception(f"创建 {partition} 失败")
-                except Exception as e:
-                    log_func(f"❌ {e}")
-                    raise
-
-            elif step_type == 'set_slot':
-                slot = step['slot']
-                log_func(f"设置活动槽位: {slot}")
-                try:
-                    result = subprocess.run(
-                        [fb, 'set_active', slot],
-                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, timeout=30, **self._popen_kwargs_silent()
-                    )
-                    out = result.stdout.strip()
-                    if out:
-                        log_func(out)
-                    log_func(f"活动槽位已设置为: {slot}")
-                except Exception as e:
-                    log_func(f"警告: 设置活动槽位失败: {e}")

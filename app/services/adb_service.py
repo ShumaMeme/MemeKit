@@ -4,7 +4,6 @@ import socket
 import struct
 import time
 import uuid
-import shutil
 import sys
 from typing import Dict, List, Tuple
 from pathlib import Path
@@ -284,20 +283,22 @@ def _adb_bin() -> str:
     return str(ADB_BIN) if ADB_BIN.exists() else "adb"
 
 
-def run_adb(args: List[str], timeout: int = 10) -> Tuple[int, str]:
+def run_adb(args: List[str], timeout: int = 10, cwd: str = None) -> Tuple[int, str]:
     adb = _adb_bin()
     cmd = [adb] + list(args or [])
     try:
-        r = subprocess.run(
-            cmd,
+        kwargs = dict(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             encoding='utf-8',
             errors='replace',
             timeout=timeout,
-            **_silent_kwargs(),
         )
+        if cwd:
+            kwargs['cwd'] = cwd
+        kwargs.update(_silent_kwargs())
+        r = subprocess.run(cmd, **kwargs)
         return int(r.returncode), (r.stdout or '').strip()
     except subprocess.TimeoutExpired:
         return 124, 'timeout'
@@ -319,84 +320,12 @@ def _normalize_host_port(host: str, port: str | int) -> str:
     return f"{h}:{p}"
 
 
-def adb_pair(host: str, port: str | int, pairing_code: str, timeout: int = 15) -> Tuple[int, str]:
-    hp = _normalize_host_port(host, port)
-    code = str(pairing_code or '').strip()
-    if not hp or not code:
-        return 2, 'missing host/port or pairing code'
-    try:
-        _ensure_adb_server_running()
-        out = _adb_server(timeout=float(timeout)).host_pair(hp, code, timeout=float(timeout))
-        return 0, (out or '').strip()
-    except Exception:
-        return run_adb(['pair', hp, code], timeout=timeout)
-
-
-def adb_connect(host: str, port: str | int, timeout: int = 10) -> Tuple[int, str]:
-    hp = _normalize_host_port(host, port)
-    if not hp:
-        return 2, 'missing host/port'
-    try:
-        _ensure_adb_server_running()
-        out = _adb_server(timeout=float(timeout)).host_connect(hp, timeout=float(timeout))
-        return 0, (out or '').strip()
-    except Exception:
-        return run_adb(['connect', hp], timeout=timeout)
-
-
-def adb_disconnect(host: str | None = None, port: str | int | None = None, timeout: int = 10) -> Tuple[int, str]:
-    if host:
-        hp = _normalize_host_port(host, port or '')
-        try:
-            _ensure_adb_server_running()
-            out = _adb_server(timeout=float(timeout)).host_disconnect(hp, timeout=float(timeout))
-            return 0, (out or '').strip()
-        except Exception:
-            return run_adb(['disconnect', hp], timeout=timeout)
-    try:
-        _ensure_adb_server_running()
-        out = _adb_server(timeout=float(timeout)).host_disconnect(None, timeout=float(timeout))
-        return 0, (out or '').strip()
-    except Exception:
-        return run_adb(['disconnect'], timeout=timeout)
-
-
-def adb_mdns_services(timeout: int = 5) -> Tuple[int, str]:
-    try:
-        _ensure_adb_server_running()
-        out = _adb_server(timeout=float(timeout)).host_mdns_services(timeout=float(timeout))
-        return 0, (out or '').strip()
-    except Exception:
-        return run_adb(['mdns', 'services'], timeout=timeout)
-
-
 def adb_kill_server() -> Tuple[int, str]:
     return run_adb(['kill-server'], timeout=10)
 
 
 def adb_start_server() -> Tuple[int, str]:
     return run_adb(['start-server'], timeout=10)
-
-
-def check_adb_available() -> bool:
-    # Must be fast and non-blocking (used on UI thread).
-    try:
-        if ADB_BIN.exists():
-            return True
-    except Exception:
-        pass
-    try:
-        if shutil.which("adb"):
-            return True
-    except Exception:
-        pass
-    # As a last resort, check whether adb server is reachable.
-    try:
-        c = _adb_server(timeout=0.3)
-        c.host_devices(timeout=0.3)
-        return True
-    except Exception:
-        return False
 
 
 def list_devices() -> List[str]:
@@ -436,11 +365,160 @@ def list_devices() -> List[str]:
     return []
 
 
+def list_all_devices() -> List[str]:
+    """返回所有在线设备 serial，包括 ADB(system/sideload) 和 Fastboot(bootloader/fastbootd) 模式。
+
+    用于设备选择器：设备重启到 Bootloader/Fastboot 后不会出现在 adb devices 中，
+    但 fastboot devices 能检测到。合并两者确保设备选择器能列出所有在线设备。
+    """
+    return [s for s, _ in list_all_devices_with_mode()]
+
+
+def list_all_devices_with_mode() -> List[Tuple[str, str]]:
+    """返回所有在线设备 (serial, mode) 列表，包括模式标识。
+
+    模式取值：system / sideload / bootloader / fastbootd
+    用于设备选择器显示模式标识（如 "serial (Fastbootd)"）。
+    """
+    devices: List[Tuple[str, str]] = []
+    seen: set = set()
+
+    # 1. 获取 ADB 模式设备（state == "device" 或 "sideload"）
+    try:
+        _ensure_adb_server_running()
+        devs = _adb_server(timeout=3.0).host_devices(timeout=3.0)
+        for s, st in devs:
+            if st in ("device", "sideload") and s not in seen:
+                mode = "sideload" if st == "sideload" else "system"
+                devices.append((s, mode))
+                seen.add(s)
+    except Exception:
+        pass
+
+    # subprocess 回退（覆盖 host_devices 失败的情况）
+    if not devices:
+        try:
+            adb = str(ADB_BIN) if ADB_BIN.exists() else "adb"
+            out = _run([adb, "devices"], timeout=3)
+            for line in out.splitlines()[1:]:
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] in ("device", "sideload"):
+                    if parts[0] not in seen:
+                        mode = "sideload" if parts[1] == "sideload" else "system"
+                        devices.append((parts[0], mode))
+                        seen.add(parts[0])
+        except Exception:
+            pass
+
+    # 2. 获取 Fastboot 模式设备（bootloader/fastbootd）
+    # 直接解析 fastboot devices 输出的状态字段，区分 bootloader 和 fastbootd
+    try:
+        fb = str(FASTBOOT_BIN) if FASTBOOT_BIN.exists() else "fastboot"
+        out = _run([fb, "devices"], timeout=2)
+        if out:
+            for line in out.splitlines():
+                line = line.strip()
+                if not line or line.startswith("(bootloader)"):
+                    continue
+                parts = line.split()
+                if parts and len(parts) >= 2:
+                    fb_serial = parts[0]
+                    if fb_serial not in seen:
+                        state = parts[1].lower()
+                        if "fastbootd" in state:
+                            mode = "fastbootd"
+                        elif "fastboot" in state:
+                            # 备用：用 getvar is-userspace 进一步确认
+                            # 注意：fastboot getvar 输出在 stderr，必须用 _fastboot
+                            try:
+                                is_userspace = _fastboot(["getvar", "is-userspace"], timeout=2, serial=fb_serial)
+                                mode = "fastbootd" if is_userspace and "yes" in is_userspace.lower() else "bootloader"
+                            except Exception:
+                                mode = "bootloader"
+                        else:
+                            mode = "bootloader"
+                        devices.append((fb_serial, mode))
+                        seen.add(fb_serial)
+    except Exception:
+        pass
+
+    return devices
+
+
 def _getprop(serial: str, key: str) -> str:
     if not serial:
         return ""
     adb = str(ADB_BIN) if ADB_BIN.exists() else "adb"
     return _run([adb, "-s", serial, "shell", "getprop", key], timeout=3)
+
+
+def _getprop_batch(serial: str, keys: list) -> dict:
+    """批量查询多个 getprop 属性，用一次 ADB shell 调用替代 N 次子进程。
+
+    将 N 次 adb 子进程往返（每次 150-400ms）压缩为 1 次 socket 调用，
+    显著降低仪表盘刷新延迟。
+    """
+    if not serial or not keys:
+        return {}
+    try:
+        parts = []
+        for k in keys:
+            parts.append('echo "\\x01{0}\\x01"; getprop "{0}"'.format(k))
+        cmd = "; ".join(parts)
+        out = adb_shell_serial(serial, cmd, timeout=10)
+        result = {}
+        current_key = None
+        for line in out.splitlines():
+            if "\x01" in line:
+                # 提取 \x01key\x01 标记行
+                stripped = line.strip("\x01\r\n ")
+                if stripped in keys:
+                    current_key = stripped
+                    continue
+            if current_key is not None:
+                result[current_key] = line.strip()
+                current_key = None
+        # 补全缺失的 key（值为空）
+        for k in keys:
+            result.setdefault(k, "")
+        return result
+    except Exception:
+        return {k: _getprop(serial, k) for k in keys}
+
+
+def _shell_batch(serial: str, commands: dict) -> dict:
+    """批量执行多个 shell 命令，用一次 ADB shell 调用替代 N 次。
+
+    commands: {tag: cmd_str}
+    返回: {tag: output_str}
+    """
+    if not serial or not commands:
+        return {}
+    try:
+        parts = []
+        for tag, cmd in commands.items():
+            parts.append('echo "\\x02{0}\\x02"; {1}'.format(tag, cmd))
+        cmd = "; ".join(parts)
+        out = adb_shell_serial(serial, cmd, timeout=15)
+        result = {}
+        current_tag = None
+        buf = []
+        for line in out.splitlines():
+            if "\x02" in line:
+                if current_tag is not None:
+                    result[current_tag] = "\n".join(buf)
+                stripped = line.strip("\x02\r\n ")
+                current_tag = stripped if stripped in commands else None
+                buf = []
+            elif current_tag is not None:
+                buf.append(line)
+        if current_tag is not None:
+            result[current_tag] = "\n".join(buf)
+        for tag in commands:
+            result.setdefault(tag, "")
+        return result
+    except Exception:
+        return {tag: _shell(serial, cmd) for tag, cmd in commands.items()}
 
 
 def _shell(serial: str, cmd: str) -> str:
@@ -462,10 +540,114 @@ def _adb_get_state(serial: str) -> str:
         return _run([adb, "-s", serial, "get-state"], timeout=2)
 
 
-def _fastboot(cmds: List[str], timeout: int = 5) -> str:
-    """执行 fastboot 命令，支持自定义超时"""
+def _detect_fastboot_mode(target_serial: str = "") -> Tuple[str, str]:
+    """检测 fastboot 设备的模式（bootloader 或 fastbootd）。
+
+    使用 `fastboot devices` 输出的状态字段作为主要判断依据：
+    - 输出格式：`<serial> fastboot` 或 `<serial> fastbootd`
+    - fastbootd 模式会显示 "fastbootd"，bootloader 模式显示 "fastboot"
+
+    若主检测失败，回退到 `getvar is-userspace` 命令（注意：fastboot getvar 的
+    输出在 stderr，必须用 _fastboot 函数捕获，不能用 _run）。
+
+    Args:
+        target_serial: 目标设备 serial。若指定，只检测该设备；否则检测第一台 fastboot 设备。
+
+    Returns:
+        (mode, serial): mode 为 "bootloader"/"fastbootd"/""，serial 为检测到的设备 serial。
+    """
     fb = str(FASTBOOT_BIN) if FASTBOOT_BIN.exists() else "fastboot"
-    return _run([fb] + cmds, timeout=timeout)
+    try:
+        fb_out = _run([fb, "devices"], timeout=2)
+    except Exception:
+        fb_out = ""
+
+    if not fb_out or not fb_out.strip():
+        return ("", "")
+
+    # 解析 fastboot devices 输出，收集 (serial, state) 对
+    devices: List[Tuple[str, str]] = []
+    for line in fb_out.strip().splitlines():
+        line = line.strip()
+        if not line or line.startswith("(bootloader)"):
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            devices.append((parts[0], parts[1].lower()))
+
+    if not devices:
+        return ("", "")
+
+    # 优先匹配 target_serial
+    matched = None
+    if target_serial:
+        for s, st in devices:
+            if s == target_serial:
+                matched = (s, st)
+                break
+    # 未匹配到目标，取第一个
+    if matched is None:
+        matched = devices[0]
+
+    s, st = matched
+    # 主要判断：fastboot devices 的状态字段
+    if "fastbootd" in st:
+        return ("fastbootd", s)
+    if "fastboot" in st:
+        # 状态为 fastboot，但需进一步确认是否为 fastbootd（某些 fastboot 版本不区分）
+        # 关键：fastboot getvar 的输出在 stderr，必须用 _fastboot 函数（合并 stderr 到 stdout）
+        # 用 _run 只会得到空字符串，导致 fastbootd 永远被误判为 bootloader
+        try:
+            is_userspace = _fastboot(["getvar", "is-userspace"], timeout=2, serial=s)
+            if is_userspace and "yes" in is_userspace.lower():
+                return ("fastbootd", s)
+        except Exception:
+            pass
+        return ("bootloader", s)
+
+    # 未知状态，尝试 getvar is-userspace（同样用 _fastboot 捕获 stderr）
+    try:
+        is_userspace = _fastboot(["getvar", "is-userspace"], timeout=2, serial=s)
+        if is_userspace and "yes" in is_userspace.lower():
+            return ("fastbootd", s)
+    except Exception:
+        pass
+
+    return ("bootloader", s)
+
+
+def _fastboot(cmds: List[str], timeout: int = 5, serial: str = "") -> str:
+    """执行 fastboot 命令，支持自定义超时和指定设备 serial。
+
+    注意：fastboot 的 getvar 等命令把设备响应写到 stderr 而非 stdout，
+    因此这里必须用 stderr=subprocess.STDOUT 把两路输出合并，否则会丢失
+    unlocked / current-slot 等关键信息。
+
+    Args:
+        cmds: fastboot 命令参数列表（如 ["getvar", "product"]）
+        timeout: 超时秒数
+        serial: 目标设备 serial。多台 fastboot 设备时必须指定，否则命令会失败或操作错误设备。
+    """
+    fb = str(FASTBOOT_BIN) if FASTBOOT_BIN.exists() else "fastboot"
+    full_cmds = [fb]
+    if serial:
+        full_cmds += ["-s", serial]
+    full_cmds += cmds
+    try:
+        result = subprocess.run(
+            full_cmds,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            **_silent_kwargs(),
+        )
+        return result.stdout.decode(errors='ignore')
+    except subprocess.TimeoutExpired:
+        return ""
+    except FileNotFoundError:
+        return ""
+    except Exception:
+        return ""
 
 
 def run_fastboot(args: List[str], timeout: int = 10) -> Tuple[int, str]:
@@ -504,6 +686,17 @@ def _read_sys_value(serial: str, paths: List[str]) -> int:
         except Exception:
             continue
     return 0
+
+
+def _parse_int(val) -> int:
+    """从字符串安全解析整数，失败返回 0。"""
+    try:
+        v = str(val or "").strip()
+        if not v or "No such file" in v or "Permission denied" in v:
+            return 0
+        return int(float(v))
+    except Exception:
+        return 0
 
 
 def _meminfo_value(meminfo: str, key: str) -> int:
@@ -608,13 +801,23 @@ def detect_connection_mode() -> Tuple[str, str]:
             serial = parts[0]
             if serial.lower().startswith("(bootloader)"):
                 continue
-            
-            # 使用 getvar is-userspace 精准判断 fastbootd
-            # 返回 "yes" = fastbootd, "no" = bootloader
-            is_userspace = _run([fb, "-s", serial, "getvar", "is-userspace"], timeout=2)
-            if "yes" in (is_userspace or "").lower():
+
+            # 使用统一的 fastbootd 检测函数
+            # `fastboot devices` 输出会显示 "fastbootd" 或 "fastboot" 状态
+            # 这是区分 bootloader 和 fastbootd 最可靠的方式
+            state = parts[1].lower() if len(parts) >= 2 else ""
+            if "fastbootd" in state:
                 return ("fastbootd", serial)
-            return ("bootloader", serial)
+            if "fastboot" in state:
+                # 备用：用 getvar is-userspace 进一步确认
+                # 关键：fastboot getvar 输出在 stderr，必须用 _fastboot（合并 stderr）而非 _run
+                try:
+                    is_userspace = _fastboot(["getvar", "is-userspace"], timeout=2, serial=serial)
+                    if is_userspace and "yes" in is_userspace.lower():
+                        return ("fastbootd", serial)
+                except Exception:
+                    pass
+                return ("bootloader", serial)
 
     # Fallback: detect special USB/COM port modes (Windows)
     try:
@@ -717,18 +920,59 @@ def get_device_info(serial: str) -> Dict[str, str]:
         info[k] = v.strip()
 
     add("serial", serial)
-    add("brand", _getprop(serial, "ro.product.brand"))
-    add("model", _getprop(serial, "ro.product.model"))
-    add("device", _getprop(serial, "ro.product.device"))
-    add("product", _getprop(serial, "ro.product.name"))
-    add("android_version", _getprop(serial, "ro.build.version.release"))
-    add("sdk", _getprop(serial, "ro.build.version.sdk"))
-    add("vndk", _getprop(serial, "ro.build.version.vndk"))
-    add("build_display", _getprop(serial, "ro.build.display.id"))
-    add("fingerprint", _getprop(serial, "ro.build.fingerprint"))
 
-    # 额外信息（可选）
-    battery_dump = _shell(serial, "dumpsys battery")
+    # === 批量 getprop：20+ 次子进程调用 → 1 次 socket 调用 ===
+    prop_keys = [
+        "ro.product.brand", "ro.product.model", "ro.product.device",
+        "ro.product.name", "ro.build.version.release", "ro.build.version.sdk",
+        "ro.build.version.vndk", "ro.build.display.id", "ro.build.fingerprint",
+        "ro.bootloader", "gsm.version.baseband", "ro.hardware",
+        "ro.product.cpu.abi", "ro.product.cpu.abi2",
+        "ro.boot.slot_suffix", "ro.boot.slot",
+        "ro.boot.vbmeta.device_state", "ro.boot.flash.locked",
+        "ro.boot.verifiedbootstate", "ro.debuggable", "ro.oem_unlock_supported",
+        "ro.serialno", "ro.sf.lcd_density",
+    ]
+    props = _getprop_batch(serial, prop_keys)
+    g = lambda k: props.get(k, "")
+
+    add("brand", g("ro.product.brand"))
+    add("model", g("ro.product.model"))
+    add("device", g("ro.product.device"))
+    add("product", g("ro.product.name"))
+    add("android_version", g("ro.build.version.release"))
+    add("sdk", g("ro.build.version.sdk"))
+    add("vndk", g("ro.build.version.vndk"))
+    add("build_display", g("ro.build.display.id"))
+    add("fingerprint", g("ro.build.fingerprint"))
+    add("bootloader", g("ro.bootloader"))
+    add("baseband", g("gsm.version.baseband"))
+
+    # === 批量 shell：15+ 次子进程调用 → 1 次 socket 调用 ===
+    shell_cmds = {
+        "battery": "dumpsys battery",
+        "cpuinfo": "cat /proc/cpuinfo",
+        "df": "df -h /data | tail -n 1",
+        "meminfo": "cat /proc/meminfo",
+        "kernel": "uname -r",
+        "uptime": "cat /proc/uptime",
+        "wm_size": "wm size",
+        "wm_density": "wm density",
+        "su": "which su",
+        "magisk": "which magisk",
+        "sys_mount": "mount | grep ' /system ' | grep rw",
+        "sys_charge_full_design": "cat /sys/class/power_supply/battery/charge_full_design 2>/dev/null || cat /sys/class/power_supply/BAT0/charge_full_design 2>/dev/null",
+        "sys_charge_full": "cat /sys/class/power_supply/battery/charge_full 2>/dev/null || cat /sys/class/power_supply/BAT0/charge_full 2>/dev/null",
+        "sys_mmc_type": "cat /sys/block/mmcblk0/device/type 2>/dev/null || cat /sys/block/mmcblk1/device/type 2>/dev/null",
+        "sys_sda_type": "cat /sys/block/sda/device/type 2>/dev/null || cat /sys/block/sdb/device/type 2>/dev/null",
+        "sys_sda_exists": "ls /sys/block/sda 2>/dev/null",
+        "sys_mmc_exists": "ls /sys/block/mmcblk0 2>/dev/null",
+    }
+    sh = _shell_batch(serial, shell_cmds)
+    s = lambda t: sh.get(t, "")
+
+    # battery
+    battery_dump = s("battery")
     battery_level = ""
     for line in battery_dump.splitlines():
         line = line.strip()
@@ -736,15 +980,10 @@ def get_device_info(serial: str) -> Dict[str, str]:
             battery_level = line.split(":", 1)[-1].strip()
             break
     add("battery", battery_level)
-    add("bootloader", _getprop(serial, "ro.bootloader"))
-    add("baseband", _getprop(serial, "gsm.version.baseband"))
-    
-    # CPU information
-    # 尝试多种方式获取CPU型号
+
+    # CPU
     cpu_model = ""
-    
-    # 方法1: 从 /proc/cpuinfo 获取
-    cpuinfo = _shell(serial, "cat /proc/cpuinfo")
+    cpuinfo = s("cpuinfo")
     if cpuinfo:
         for line in cpuinfo.splitlines():
             line = line.strip()
@@ -753,12 +992,8 @@ def get_device_info(serial: str) -> Dict[str, str]:
                 break
             elif line.startswith("Processor") and not cpu_model:
                 cpu_model = line.split(":", 1)[-1].strip()
-    
-    # 方法2: 从系统属性获取
     if not cpu_model:
-        cpu_model = _getprop(serial, "ro.hardware")
-    
-    # 方法3: 从 /sys/devices/system/cpu/soc 获取
+        cpu_model = g("ro.hardware")
     if not cpu_model:
         soc_id = _read_sys_value(serial, [
             "/sys/devices/system/cpu/soc0/serial_number",
@@ -766,39 +1001,27 @@ def get_device_info(serial: str) -> Dict[str, str]:
             "/sys/devices/system/cpu/soc0/id"
         ])
         if soc_id:
-            cpu_model = soc_id
-    
-    # 方法4: 尝试从dmesg获取
+            cpu_model = str(soc_id)
     if not cpu_model:
         dmesg = _shell(serial, "dmesg | grep -i 'cpu\\|processor\\|soc' | head -5")
         if dmesg:
             for line in dmesg.splitlines():
                 if any(keyword in line.lower() for keyword in ["mt", "snapdragon", "qualcomm", "mediatek", "dimensity"]):
-                    # 提取可能的CPU型号
                     match = re.search(r'(MT\d+\w*|SDM\d+\w*|SM\d+\w*|Snapdragon\s+\w+|Dimensity\s+\d+\w*)', line, re.IGNORECASE)
                     if match:
                         cpu_model = match.group(1)
                         break
-    
-    # 如果还是获取不到，使用架构信息作为后备
     if not cpu_model:
-        cpu_abi = _getprop(serial, "ro.product.cpu.abi")
-        cpu_abi2 = _getprop(serial, "ro.product.cpu.abi2")
+        cpu_abi = g("ro.product.cpu.abi")
+        cpu_abi2 = g("ro.product.cpu.abi2")
         cpu_model = cpu_abi
         if cpu_abi2 and cpu_abi2 != cpu_abi:
             cpu_model = f"{cpu_abi} ({cpu_abi2})"
-    
     add("cpu_info", cpu_model or "Unknown")
 
     # battery health
-    rated_capacity = _read_sys_value(serial, [
-        "/sys/class/power_supply/battery/charge_full_design",
-        "/sys/class/power_supply/BAT0/charge_full_design",
-    ])
-    full_capacity = _read_sys_value(serial, [
-        "/sys/class/power_supply/battery/charge_full",
-        "/sys/class/power_supply/BAT0/charge_full",
-    ])
+    rated_capacity = _parse_int(s("sys_charge_full_design"))
+    full_capacity = _parse_int(s("sys_charge_full"))
     if rated_capacity and full_capacity:
         rated_capacity, full_capacity = _harmonize_capacity_pair(rated_capacity, full_capacity)
         health_pct = max(0, min(100, int(full_capacity / rated_capacity * 100)))
@@ -809,11 +1032,10 @@ def get_device_info(serial: str) -> Dict[str, str]:
         add("battery_full_capacity", _format_capacity(full_capacity))
 
     # storage
-    df_line = _shell(serial, "df -h /data | tail -n 1")
-    add("storage_data", df_line)
+    add("storage_data", s("df"))
 
     # memory
-    meminfo = _shell(serial, "cat /proc/meminfo")
+    meminfo = s("meminfo")
     mem_total = _meminfo_value(meminfo, "MemTotal")
     mem_available = _meminfo_value(meminfo, "MemAvailable")
     if not mem_available:
@@ -827,24 +1049,23 @@ def get_device_info(serial: str) -> Dict[str, str]:
         add("memory_summary", detail)
 
     # kernel
-    kern = _shell(serial, "uname -r")
+    kern = s("kernel")
     if not kern:
         kern = _shell(serial, "cat /proc/version")
     add("kernel", kern)
 
     # slot
-    slot_suffix = _getprop(serial, "ro.boot.slot_suffix").strip()
-    slot = _getprop(serial, "ro.boot.slot").strip()
+    slot_suffix = g("ro.boot.slot_suffix").strip()
+    slot = g("ro.boot.slot").strip()
     cur_slot = (slot or slot_suffix.replace("_", "")).strip()
     add("current_slot", cur_slot)
 
     # bootloader unlock status via props
-    vb_state = _getprop(serial, "ro.boot.vbmeta.device_state").strip()  # locked/unlocked
-    flash_locked = _getprop(serial, "ro.boot.flash.locked").strip()  # 0 unlocked, 1 locked
-    verified_boot = _getprop(serial, "ro.boot.verifiedbootstate").strip()  # green/yellow/orange
-    unlock_enable = _getprop(serial, "ro.debuggable").strip()  # 1 = debuggable (often unlocked)
-    oem_unlock = _getprop(serial, "ro.oem_unlock_supported").strip()
-    
+    vb_state = g("ro.boot.vbmeta.device_state").strip()
+    flash_locked = g("ro.boot.flash.locked").strip()
+    verified_boot = g("ro.boot.verifiedbootstate").strip()
+    unlock_enable = g("ro.debuggable").strip()
+
     unlocked = "unknown"
     if vb_state:
         unlocked = "unlocked" if vb_state.lower() == "unlocked" else "locked"
@@ -859,19 +1080,18 @@ def get_device_info(serial: str) -> Dict[str, str]:
     elif unlock_enable == "1":
         unlocked = "unlocked"
     add("bootloader_unlock", unlocked)
-    
-    # 获取更多信息
+
     # 代号
-    add("codename", _getprop(serial, "ro.product.device"))
-    
-    # 序列号（已存在serial字段，这里获取设备序列号）
-    device_serial = _shell(serial, "getprop ro.serialno")
+    add("codename", g("ro.product.device"))
+
+    # 序列号
+    device_serial = g("ro.serialno")
     if not device_serial:
         device_serial = _shell(serial, "cat /proc/cmdline | tr ' ' '\\n' | grep androidboot.serialno | cut -d'=' -f2")
     add("device_serial", device_serial.strip() if device_serial else "")
-    
+
     # 已开机时间
-    uptime = _shell(serial, "cat /proc/uptime")
+    uptime = s("uptime")
     if uptime:
         try:
             uptime_seconds = float(uptime.split()[0])
@@ -889,60 +1109,49 @@ def get_device_info(serial: str) -> Dict[str, str]:
         add("uptime", uptime_str)
     else:
         add("uptime", "")
-    
+
     # 分辨率
-    wm = _shell(serial, "wm size")
+    wm = s("wm_size")
     if wm and "Physical size:" in wm:
         resolution = wm.split("Physical size:")[1].strip()
         add("resolution", resolution)
     else:
         add("resolution", "")
-    
+
     # 显示密度
-    density = _getprop(serial, "ro.sf.lcd_density")
+    density = g("ro.sf.lcd_density")
     if not density:
-        # 尝试从wm density获取
-        wm_density = _shell(serial, "wm density")
+        wm_density = s("wm_density")
         if wm_density and "Physical density:" in wm_density:
             density = wm_density.split("Physical density:")[1].strip()
     add("display_density", density)
-    
+
     # 闪存类型
-    emmc = _read_sys_value(serial, [
-        "/sys/block/mmcblk0/device/type",
-        "/sys/block/mmcblk1/device/type"
-    ])
-    ufs = _read_sys_value(serial, [
-        "/sys/block/sda/device/type",
-        "/sys/block/sdb/device/type"
-    ])
+    emmc = s("sys_mmc_type")
+    ufs = s("sys_sda_type")
     storage_type = ""
     if emmc and "mmc" in emmc.lower():
         storage_type = "eMMC"
     elif ufs and "ufs" in ufs.lower():
         storage_type = "UFS"
     else:
-        # 尝试通过其他方式判断
-        if _read_sys_value(serial, ["/sys/block/sda"]):
+        if s("sys_sda_exists"):
             storage_type = "UFS"
-        elif _read_sys_value(serial, ["/sys/block/mmcblk0"]):
+        elif s("sys_mmc_exists"):
             storage_type = "eMMC"
     add("storage_type", storage_type)
-    
+
     # Root权限状态
     root_status = "未检测到"
-    # 检查su命令是否存在
-    su_check = _shell(serial, "which su")
+    su_check = s("su")
     if su_check and su_check.strip():
         root_status = "已Root"
     else:
-        # 检查常见root管理器
-        magisk = _shell(serial, "which magisk")
+        magisk = s("magisk")
         if magisk and magisk.strip():
             root_status = "已Root (Magisk)"
         else:
-            # 检查system分区是否可写
-            system_rw = _shell(serial, "mount | grep ' /system ' | grep rw")
+            system_rw = s("sys_mount")
             if system_rw and system_rw.strip():
                 root_status = "已Root"
     add("root_status", root_status)
@@ -950,16 +1159,17 @@ def get_device_info(serial: str) -> Dict[str, str]:
     return info
 
 
-def reboot_to(target: str) -> Tuple[bool, str]:
+def reboot_to(target: str, serial: str = "") -> Tuple[bool, str]:
     """Reboot device to target: bootloader, recovery, fastbootd, system, edl.
     Auto-detect current mode and use adb or fastboot accordingly.
+    若指定 serial，则仅对该设备执行（多设备连接时必需）。
     Returns (ok, message).
     """
     target = (target or "").strip().lower()
     if target not in ("bootloader", "recovery", "fastbootd", "system", "edl"):
         return False, f"不支持的目标: {target}"
 
-    mode, serial = detect_connection_mode()
+    target_serial = (serial or "").strip()
     adb = str(ADB_BIN) if ADB_BIN.exists() else "adb"
     fb = str(FASTBOOT_BIN) if FASTBOOT_BIN.exists() else "fastboot"
 
@@ -969,78 +1179,130 @@ def reboot_to(target: str) -> Tuple[bool, str]:
     def _fail(msg: str):
         return False, msg
 
+    # 关键修复：不再调用 detect_connection_mode()（会遍历所有设备并逐个 getvar，多设备时阻塞）
+    # 而是针对 target_serial 精确检测其当前模式，避免阻塞和误操作其他设备
+    mode = "none"
+    detected_serial = ""
+
+    if target_serial:
+        # 1. 检查 target_serial 是否在 ADB 设备列表中
+        try:
+            _ensure_adb_server_running()
+            devs = _adb_server(timeout=2.0).host_devices(timeout=2.0)
+            for s, st in devs:
+                if s == target_serial:
+                    if st == "device":
+                        mode = "system"
+                    elif st == "sideload":
+                        mode = "sideload"
+                    elif st in ("offline", "unauthorized"):
+                        mode = "offline"
+                    else:
+                        mode = "system"
+                    detected_serial = target_serial
+                    break
+        except Exception:
+            pass
+
+        # 2. 若不在 ADB 列表，使用统一的 fastboot 模式检测函数
+        if mode in ("none", ""):
+            try:
+                fb_mode, fb_serial = _detect_fastboot_mode(target_serial)
+                if fb_mode:
+                    mode = fb_mode
+                    detected_serial = fb_serial
+            except Exception:
+                pass
+    else:
+        # 未指定 serial，回退到自动检测（单设备场景）
+        mode, detected_serial = detect_connection_mode()
+
+    serial = target_serial or detected_serial
+
     # If nothing connected
     if mode == "none" or not (serial or mode in ("fastbootd", "bootloader")):
         return _fail("未检测到已连接设备")
 
+    # 若指定了 serial 但与检测到的不同，且当前为 ADB 模式，则用 -s 显式指定
+    use_serial_flag = bool(serial) and mode in ("system", "sideload")
+
     # Map of actions per mode
     if mode in ("system", "sideload"):
         # Use ADB reboot variants
+        adb_cmd = [adb]
+        if use_serial_flag:
+            adb_cmd += ["-s", serial]
         if target == "system":
-            out = _run([adb, "reboot"])  # simple reboot to system
+            out = _run(adb_cmd + ["reboot"])  # simple reboot to system
             return _ok(out or "已重启到系统")
         if target == "bootloader":
-            out = _run([adb, "reboot", "bootloader"])
+            out = _run(adb_cmd + ["reboot", "bootloader"])
             return _ok(out or "正在重启到 Bootloader")
         if target == "fastbootd":
-            out = _run([adb, "reboot", "fastboot"])  # userspace fastbootd
+            out = _run(adb_cmd + ["reboot", "fastboot"])  # userspace fastbootd
             return _ok(out or "正在重启到 FastbootD")
         if target == "recovery":
-            out = _run([adb, "reboot", "recovery"])
+            out = _run(adb_cmd + ["reboot", "recovery"])
             return _ok(out or "正在重启到 Recovery")
         if target == "edl":
             # Some devices may accept this; otherwise user must enter from fastboot
-            out = _run([adb, "reboot", "edl"])
+            out = _run(adb_cmd + ["reboot", "edl"])
             if out:
                 return _ok(out)
             return _ok("已尝试通过 ADB 进入 EDL（是否成功取决于设备支持）")
 
     # Fastboot/Bootloader family
     if mode in ("fastbootd", "bootloader"):
+        # fastboot 模式下，若有多设备需要用 -s serial 指定
+        fb_cmd = [fb]
+        if serial:
+            fb_cmd += ["-s", serial]
         if target == "system":
-            out = _run([fb, "reboot"])
+            out = _run(fb_cmd + ["reboot"], timeout=10)
             return _ok(out or "正在重启到系统")
         if target == "bootloader":
-            out = _run([fb, "reboot-bootloader"]) if mode != "bootloader" else ""
+            out = _run(fb_cmd + ["reboot-bootloader"], timeout=10) if mode != "bootloader" else ""
             return _ok(out or "已在 Bootloader 或正在进入 Bootloader")
         if target == "fastbootd":
             # Enter userspace fastboot
-            out = _run([fb, "reboot", "fastboot"])  # fastboot reboot fastboot
+            out = _run(fb_cmd + ["reboot", "fastboot"], timeout=10)  # fastboot reboot fastboot
             return _ok(out or "正在重启到 FastbootD")
         if target == "recovery":
             # Not universally supported, but commonly available
-            out = _run([fb, "reboot", "recovery"])
+            out = _run(fb_cmd + ["reboot", "recovery"], timeout=10)
             if out:
                 return _ok(out)
             # Fallback OEM command
-            out2 = _run([fb, "oem", "reboot-recovery"])  # vendor specific
+            out2 = _run(fb_cmd + ["oem", "reboot-recovery"], timeout=10)  # vendor specific
             return _ok(out2 or "已尝试进入 Recovery（是否成功取决于设备支持）")
         if target == "edl":
             # Qualcomm devices (OnePlus) often support either command
-            out = _run([fb, "oem", "edl"])  # try OEM first
+            out = _run(fb_cmd + ["oem", "edl"], timeout=10)  # try OEM first
             if out:
                 return _ok(out)
-            out2 = _run([fb, "edl"])  # standard new fastboot cmd
+            out2 = _run(fb_cmd + ["edl"], timeout=10)  # standard new fastboot cmd
             return _ok(out2 or "已尝试进入 EDL（是否成功取决于设备支持）")
 
     return _fail("未能执行重启命令")
 
 
 # -------- ADB File Ops --------
-def list_dir(path: str) -> Tuple[List[Dict[str, str]], str]:
+def list_dir(path: str, serial: str = "") -> Tuple[List[Dict[str, str]], str]:
     """List directory on device. Returns (items, err).
     Each item: {name, size, type: 'dir'|'file'}
     """
     p = path or "/"
     try:
-        serials = list_devices()
-        serial = serials[0] if serials else ""
+        if not serial:
+            serials = list_devices()
+            serial = serials[0] if serials else ""
         if serial and _ensure_adb_server_running():
             # Fast path: avoid heavy `ls -l` parsing and avoid SYNC metadata overhead.
             # `ls -1p` appends '/' to dirs (toybox/busybox compatible in most ROMs).
             out = _adb_server(timeout=6.0).shell(serial, f"sh -c \"ls -1p '{p}' 2>/dev/null || toybox ls -1p '{p}' 2>/dev/null\"", timeout=6.0)
             if out and ("No such file" not in out) and ("Permission denied" not in out):
                 items: List[Dict[str, str]] = []
+                import re as _re
                 for line in (out or "").splitlines():
                     name = (line or "").strip()
                     if not name:
@@ -1048,6 +1310,9 @@ def list_dir(path: str) -> Tuple[List[Dict[str, str]], str]:
                     is_dir = name.endswith('/')
                     if is_dir:
                         name = name[:-1]
+                    # 反转义 toybox/busybox ls 的 shell 转义（如 '\ ' -> ' ', '\(' -> '('）
+                    # 避免含空格/特殊字符的文件名被错误转义导致后续操作失败
+                    name = _re.sub(r'\\(.)', r'\1', name)
                     items.append({"name": name, "size": "-", "type": ("dir" if is_dir else "file")})
                 return items, ""
 
@@ -1103,31 +1368,12 @@ def list_dir(path: str) -> Tuple[List[Dict[str, str]], str]:
     return items, ""
 
 
-def pull_file(remote: str, local: str) -> Tuple[bool, str]:
-    """adb pull remote local. Returns (ok, msg)."""
-    try:
-        serials = list_devices()
-        serial = serials[0] if serials else ""
-        if serial and _ensure_adb_server_running():
-            _adb_server(timeout=600.0).sync_pull_file(serial, remote, local, timeout=600.0)
-            return True, "完成"
-        raise RuntimeError("no device")
-    except Exception as e:
-        adb = str(ADB_BIN) if ADB_BIN.exists() else "adb"
-        try:
-            out = _run([adb, "pull", remote, local], timeout=600)
-            if out is None:
-                out = ""
-            return True, out or "完成"
-        except Exception:
-            return False, str(e)
-
-
 # -------- Mobile-side Ops (ADB shell) --------
-def _adb_shell(args: List[str], timeout: int = 20) -> str:
+def _adb_shell(args: List[str], timeout: int = 20, serial: str = "") -> str:
     try:
-        serials = list_devices()
-        serial = serials[0] if serials else ""
+        if not serial:
+            serials = list_devices()
+            serial = serials[0] if serials else ""
         if serial and _ensure_adb_server_running():
             cmd = " ".join([str(x) for x in (args or [])])
             return _adb_server(timeout=float(timeout)).shell(serial, cmd, timeout=float(timeout))
@@ -1235,51 +1481,57 @@ def adb_install_apk(serial: str, apk_path: str, *, reinstall: bool = False, down
         return False, str(e)
 
 
-def path_exists(path: str) -> bool:
-    out = _adb_shell(["ls", path], timeout=6)
-    return bool(out.strip()) and ("No such file" not in out)
-
-
-def is_dir(path: str) -> bool:
-    out = _adb_shell(["sh", "-c", f"[ -d '{path}' ] && echo d || echo f"], timeout=6)
+def is_dir(path: str, serial: str = "") -> bool:
+    out = _adb_shell([f"[ -d {_sh_quote(path)} ] && echo d || echo f"], timeout=6, serial=serial)
     return out.strip().startswith('d')
 
 
-def mkdir_p(path: str) -> Tuple[bool, str]:
-    out = _adb_shell(["mkdir", "-p", path], timeout=8)
+def mkdir_p(path: str, serial: str = "") -> Tuple[bool, str]:
+    out = _adb_shell([f"mkdir -p {_sh_quote(path)}"], timeout=8, serial=serial)
     ok = True if (out is None or out.strip() == "") else True
     return ok, out or ""
 
 
-def delete_path(path: str) -> Tuple[bool, str]:
-    out = _adb_shell(["rm", "-rf", path], timeout=20)
-    return True, out or ""
+def delete_path(path: str, serial: str = "") -> Tuple[bool, str]:
+    out = _adb_shell([f"rm -rf {_sh_quote(path)} && echo __OK__"], timeout=20, serial=serial)
+    if "__OK__" in (out or ""):
+        return True, ""
+    return False, (out or "删除失败").strip()
 
 
-def move_path(src: str, dst_dir: str) -> Tuple[bool, str]:
-    # Ensure target directory exists
-    mkdir_p(dst_dir)
-    out = _adb_shell(["sh", "-c", f"mv '{src}' '{dst_dir}/'"], timeout=30)
-    return True, out or ""
+def move_path(src: str, dst_dir: str, serial: str = "") -> Tuple[bool, str]:
+    # 同目录无需移动
+    src_parent = src.rsplit('/', 1)[0] if '/' in src else ''
+    if src_parent == dst_dir:
+        return True, ""
+    mkdir_p(dst_dir, serial=serial)
+    out = _adb_shell([f"mv {_sh_quote(src)} {_sh_quote(dst_dir)}/ && echo __OK__"], timeout=30, serial=serial)
+    if "__OK__" in (out or ""):
+        return True, ""
+    return False, (out or "移动失败").strip()
 
 
-def copy_path(src: str, dst_dir: str) -> Tuple[bool, str]:
-    # Try cp -r, fallback to toybox cp -r
-    mkdir_p(dst_dir)
-    out = _adb_shell(["sh", "-c", f"cp -r '{src}' '{dst_dir}/' || toybox cp -r '{src}' '{dst_dir}/'"], timeout=120)
-    return True, out or ""
+def copy_path(src: str, dst_dir: str, serial: str = "") -> Tuple[bool, str]:
+    mkdir_p(dst_dir, serial=serial)
+    out = _adb_shell([f"cp -r {_sh_quote(src)} {_sh_quote(dst_dir)}/ && echo __OK__ || toybox cp -r {_sh_quote(src)} {_sh_quote(dst_dir)}/ && echo __OK__"], timeout=120, serial=serial)
+    if "__OK__" in (out or ""):
+        return True, ""
+    return False, (out or "复制失败").strip()
 
 
-def rename_path(src: str, new_name: str) -> Tuple[bool, str]:
+def rename_path(src: str, new_name: str, serial: str = "") -> Tuple[bool, str]:
     parent = src.rsplit('/', 1)[0] if '/' in src else '/'
-    out = _adb_shell(["sh", "-c", f"mv '{src}' '{parent}/{new_name}'"], timeout=15)
-    return True, out or ""
+    dst = parent + '/' + new_name
+    out = _adb_shell([f"mv {_sh_quote(src)} {_sh_quote(dst)} && echo __OK__"], timeout=15, serial=serial)
+    if "__OK__" in (out or ""):
+        return True, ""
+    return False, (out or "重命名失败").strip()
 
 
-def stat_path(path: str) -> dict:
+def stat_path(path: str, serial: str = "") -> dict:
     # Use stat if available; fallback to ls -ld and du -s
     info: dict = {"path": path}
-    s = _adb_shell(["sh", "-c", f"stat -c '%F|%s|%a|%U|%G|%y' '{path}' || toybox stat -c '%F|%s|%a|%U|%G|%y' '{path}'"], timeout=8)
+    s = _adb_shell(["sh", "-c", f"stat -c '%F|%s|%a|%U|%G|%y' '{path}' || toybox stat -c '%F|%s|%a|%U|%G|%y' '{path}'"], timeout=8, serial=serial)
     if s and '|' in s:
         try:
             ftype, size, perm, user, group, mtime = s.strip().split('|', 5)
@@ -1288,111 +1540,83 @@ def stat_path(path: str) -> dict:
         except Exception:
             pass
     # Fallbacks
-    ls = _adb_shell(["ls", "-ld", path], timeout=6)
+    ls = _adb_shell(["ls", "-ld", path], timeout=6, serial=serial)
     info["raw_ls"] = ls
-    du = _adb_shell(["du", "-s", path], timeout=10)
+    du = _adb_shell(["du", "-s", path], timeout=10, serial=serial)
     info["raw_du"] = du
     return info
 
 
-def pull_path(remote: str, local_dest: str) -> Tuple[bool, str]:
-    """adb pull remote local_dest (支持文件或目录)."""
-    try:
+def pull_path(remote: str, local_dest: str, serial: str = "") -> Tuple[bool, str]:
+    """adb pull remote local_dest (支持文件或目录).
+
+    直接使用 adb pull 子进程，原生支持文件和目录递归，最可靠。
+    """
+    if not serial:
         serials = list_devices()
         serial = serials[0] if serials else ""
-        if not serial or not _ensure_adb_server_running():
-            raise RuntimeError("未检测到设备")
+    if not serial:
+        return False, "未检测到设备"
 
-        # Try directory listing; if it fails, treat as file.
-        try:
-            entries = _adb_server(timeout=20.0).sync_list(serial, remote, timeout=20.0)
-        except Exception:
-            entries = []
-
-        if entries:
-            import os
-            os.makedirs(local_dest, exist_ok=True)
-            for e in entries:
-                name = (e.get('name') or '').strip()
-                if not name or name in ('.', '..'):
-                    continue
-                rpath = (remote.rstrip('/') + '/' + name) if remote not in ('/', '') else ('/' + name)
-                mode = int(e.get('mode') or 0)
-                is_dir = bool(mode & 0o040000)
-                lpath = str(Path(local_dest) / name)
-                if is_dir:
-                    ok, msg = pull_path(rpath, lpath)
-                    if not ok:
-                        return False, msg
-                else:
-                    _adb_server(timeout=3600.0).sync_pull_file(serial, rpath, lpath, timeout=3600.0)
-            return True, "完成"
-
-        _adb_server(timeout=3600.0).sync_pull_file(serial, remote, local_dest, timeout=3600.0)
-        return True, "完成"
-    except Exception as e:
-        adb = str(ADB_BIN) if ADB_BIN.exists() else "adb"
-        try:
-            out = _run([adb, "pull", remote, local_dest], timeout=3600)
-            if out is None:
-                out = ""
-            return True, out or "完成"
-        except Exception:
-            return False, str(e)
-
-
-def push_path(local_path: str, remote_dir: str) -> Tuple[bool, str]:
-    """adb push local_path remote_dir (支持文件或目录)."""
+    adb = str(ADB_BIN) if ADB_BIN.exists() else "adb"
+    # adb pull 原生支持目录递归；确保本地目录存在
     try:
-        serials = list_devices()
-        serial = serials[0] if serials else ""
-        if not serial or not _ensure_adb_server_running():
-            raise RuntimeError("未检测到设备")
-
-        lp = Path(local_path)
-        if not lp.exists():
-            return False, "本地文件不存在"
-
-        if lp.is_dir():
-            mkdir_p(remote_dir)
-            for child in lp.iterdir():
-                dst = (remote_dir.rstrip('/') + '/' + child.name) if remote_dir not in ('/', '') else ('/' + child.name)
-                ok, msg = push_path(str(child), dst)
-                if not ok:
-                    return False, msg
-            return True, "完成"
-
-        r = remote_dir
-        if r.endswith('/') or r in ('/', ''):
-            r = (r.rstrip('/') + '/' + lp.name) if r not in ('/', '') else ('/' + lp.name)
-
-        _adb_server(timeout=3600.0).sync_push_file(serial, str(lp), r, timeout=3600.0)
-        return True, "完成"
-    except Exception as e:
-        adb = str(ADB_BIN) if ADB_BIN.exists() else "adb"
-        try:
-            out = _run([adb, "push", local_path, remote_dir], timeout=3600)
-            if out is None:
-                out = ""
-            return True, out or "完成"
-        except Exception:
-            return False, str(e)
-
-
-def get_board_id(serial: str) -> str:
-    """Extract BOARD_ID (oplusboot.serialno) from /proc/cmdline when available."""
-    try:
-        cmdline = _shell(serial, "cat /proc/cmdline")
+        import os as _os
+        local_parent = _os.path.dirname(local_dest) or "."
+        _os.makedirs(local_parent, exist_ok=True)
     except Exception:
-        cmdline = ""
-    if not cmdline:
-        return ""
-    token = "oplusboot.serialno="
-    idx = cmdline.find(token)
-    if idx == -1:
-        return ""
-    rest = cmdline[idx + len(token):]
-    return (rest.split()[0] if rest else "").strip()
+        pass
+
+    [adb, "-s", serial, "pull", remote, local_dest]
+    code, out = run_adb(["-s", serial, "pull", remote, local_dest], timeout=3600)
+    if code == 0:
+        return True, out or "完成"
+    return False, out or "拉取失败"
+
+
+def push_path(local_path: str, remote_dir: str, serial: str = "") -> Tuple[bool, str]:
+    """adb push local_path remote_dir (支持文件或目录).
+
+    直接使用 adb push 子进程，原生支持文件和目录递归，最可靠。
+    使用 cwd 切换到源文件父目录 + 相对路径，避免 adb 解析含中文的绝对路径时出错。
+    """
+    if not serial:
+        serials = list_devices()
+        serial = serials[0] if serials else ""
+    if not serial:
+        return False, "未检测到设备"
+
+    lp = Path(local_path)
+    if not lp.exists():
+        return False, "本地文件不存在"
+
+    # adb push 原生支持目录递归；确保远程目录存在
+    r = remote_dir or '/storage/emulated/0'
+    try:
+        mkdir_p(r)
+    except Exception:
+        pass
+    if lp.is_dir():
+        # 目录：远程目标为目录路径（不带尾斜杠，adb 会在该目录下创建同名子目录）
+        target = r.rstrip('/')
+    else:
+        # 文件：远程目标必须是 "目录/文件名" 完整路径，否则 adb 会把文件内容
+        # 写成一个名为目录名的文件
+        target = r.rstrip('/') + '/' + lp.name
+
+    # 关键修复：cd 到源文件/文件夹的父目录，用相对路径 push
+    # 避免 adb 解析含中文的绝对路径时路径被截断/错乱
+    cwd = str(lp.parent) if lp.is_file() else str(lp.parent)
+    push_name = lp.name  # 相对路径：文件夹名或文件名
+
+    code, out = run_adb(
+        ["-s", serial, "push", push_name, target],
+        timeout=3600,
+        cwd=cwd,
+    )
+    if code == 0:
+        return True, out or "完成"
+    return False, out or "推送失败"
 
 
 def _mode_cn(mode: str) -> str:
@@ -1409,8 +1633,40 @@ def _mode_cn(mode: str) -> str:
     return mapping.get(mode, mode or "未知")
 
 
-def connection_summary() -> Dict[str, str]:
-    mode, serial = detect_connection_mode()
+def connection_summary(serial: str = "") -> Dict[str, str]:
+    target_serial = str(serial or "").strip()
+    if target_serial:
+        # 使用指定 serial 检测该设备的状态，避免总是返回第一台设备
+        mode = "none"
+        try:
+            devs = _adb_server(timeout=2.0).host_devices(timeout=2.0)
+            for s, st in devs:
+                if s == target_serial:
+                    if st == "device":
+                        mode = "system"
+                    elif st == "sideload":
+                        mode = "sideload"
+                    elif st in ("offline", "unauthorized"):
+                        mode = "offline"
+                    else:
+                        mode = "system"
+                    break
+        except Exception:
+            pass
+
+        # 关键修复：若 target_serial 不在 ADB 列表，检查 fastboot 模式
+        # 否则 fastbootd/bootloader 设备会被误判为"未连接"
+        if mode in ("none", ""):
+            try:
+                fb_mode, fb_serial = _detect_fastboot_mode(target_serial)
+                if fb_mode:
+                    mode = fb_mode
+                    target_serial = fb_serial
+            except Exception:
+                pass
+        serial = target_serial
+    else:
+        mode, serial = detect_connection_mode()
     cn = _mode_cn(mode)
     serial = serial or ""
     summary: Dict[str, str] = {
@@ -1458,14 +1714,77 @@ def connection_summary() -> Dict[str, str]:
     return summary
 
 
-def collect_overall_info() -> Dict[str, str]:
-    summary = connection_summary()
+def collect_overall_info(serial: str = "") -> Dict[str, str]:
+    # 如果指定了 serial，则使用它构造 summary，避免总是取第一台设备
+    target_serial = str(serial or "").strip()
+    if target_serial:
+        # 验证设备在线并确定模式
+        mode = "none"
+        online_devs: List[tuple] = []
+        try:
+            online_devs = _adb_server(timeout=2.0).host_devices(timeout=2.0)
+            for s, st in online_devs:
+                if s == target_serial:
+                    if st == "device":
+                        mode = "system"
+                    elif st == "sideload":
+                        mode = "sideload"
+                    elif st in ("offline", "unauthorized"):
+                        mode = "offline"
+                    else:
+                        mode = "system"
+                    break
+        except Exception:
+            pass
+
+        # 若 target_serial 不在 ADB 设备列表中，检查是否处于 fastboot 模式
+        # 设备重启到 fastboot/bootloader 后不会出现在 adb devices 中，但 fastboot devices 能检测到
+        if mode in ("none", ""):
+            try:
+                fb_mode, fb_serial = _detect_fastboot_mode(target_serial)
+                if fb_mode:
+                    mode = fb_mode
+                    target_serial = fb_serial
+            except Exception:
+                pass
+
+        # 若仍为 none/offline，返回断开状态（此时设备确实不在线）
+        if mode in ("none", "offline", ""):
+            cn = _mode_cn(mode) if mode else "已断开"
+            return {
+                "connection_status": mode or "none",
+                "serial": target_serial,
+                "connected": False,
+                "status_conn": f"设备：{cn}",
+                "status_mode": f"模式：{cn}",
+                "status_line": f"已断开：{target_serial}",
+                "status_color": "#86909c",
+                "banner_state": "disconnected",
+            }
+
+        # target_serial 确实在线，构造 summary
+        summary = connection_summary()
+        summary["mode"] = mode
+        summary["serial"] = target_serial
+        summary["connected"] = mode in ("system", "sideload", "fastbootd", "bootloader", "edl", "brom")
+        cn = _mode_cn(mode)
+        if mode in ("system", "sideload", "fastbootd", "bootloader"):
+            summary["status_conn"] = f"设备：已连接（{cn}）"
+            summary["status_mode"] = f"模式：{cn}"
+            summary["status_line"] = f"已连接：{cn}"
+            summary["status_color"] = "#00b42a"
+            summary["banner_state"] = "connected"
+    else:
+        summary = connection_summary()
     mode = summary["mode"]
     serial = summary["serial"]
     info: Dict[str, str] = {"connection_status": mode, "serial": serial}
     if mode in ("system", "sideload") and serial:
-        dev = get_device_info(serial)
-        info.update(dev)
+        try:
+            dev = get_device_info(serial)
+            info.update(dev)
+        except Exception:
+            pass
     elif mode in ("fastbootd", "bootloader"):
         # Query via fastboot where possible (使用较短的超时)
         def clean_fastboot_output(output):
@@ -1490,7 +1809,7 @@ def collect_overall_info() -> Dict[str, str]:
             
             return clean_output
         
-        prod = _fastboot(["getvar", "product"], timeout=2) or ""
+        prod = _fastboot(["getvar", "product"], timeout=2, serial=target_serial) or ""
         prod = clean_fastboot_output(prod)
         # 提取 product: 后面的值，去除冗余前缀
         if "product:" in prod:
@@ -1498,8 +1817,8 @@ def collect_overall_info() -> Dict[str, str]:
             info["product"] = product_value
         else:
             info["product"] = prod
-        
-        cur_slot = _fastboot(["getvar", "current-slot"], timeout=2) or ""
+
+        cur_slot = _fastboot(["getvar", "current-slot"], timeout=2, serial=target_serial) or ""
         cur_slot = clean_fastboot_output(cur_slot)
         # 提取 current-slot: 或 SLOT: 后面的值，去除冗余前缀
         if "current-slot:" in cur_slot:
@@ -1510,19 +1829,19 @@ def collect_overall_info() -> Dict[str, str]:
             info["current_slot"] = slot_value
         else:
             info["current_slot"] = cur_slot
-        
+
         status = "unknown"
         # 使用 fastboot getvar unlocked 检测bootloader锁状态
-        unlock_state = _fastboot(["getvar", "unlocked"], timeout=2) or ""
+        unlock_state = _fastboot(["getvar", "unlocked"], timeout=2, serial=target_serial) or ""
         unlock_state = clean_fastboot_output(unlock_state)
         if "yes" in unlock_state.lower():
             status = "unlocked"
         elif "no" in unlock_state.lower():
             status = "locked"
-        
+
         if status == "unknown":
             # 备用方法：尝试 secure 变量
-            boot_state = _fastboot(["getvar", "secure"], timeout=2) or ""
+            boot_state = _fastboot(["getvar", "secure"], timeout=2, serial=target_serial) or ""
             boot_state = clean_fastboot_output(boot_state)
             if "no" in boot_state.lower():
                 status = "unlocked"

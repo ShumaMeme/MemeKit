@@ -128,6 +128,13 @@ class DisclaimerDialog(QWidget):
         self._opacity = QGraphicsOpacityEffect(self)
         self.setGraphicsEffect(self._opacity)
 
+        # 性能模式下关闭弹窗淡入淡出动画
+        try:
+            from app.components.hidden_settings import is_dialog_animation_disabled
+            self._no_animation = is_dialog_animation_disabled()
+        except Exception:
+            self._no_animation = False
+
         self._fade_in = QPropertyAnimation(self._opacity, b"opacity", self)
         self._fade_in.setDuration(300)
         self._fade_in.setStartValue(0.0)
@@ -142,8 +149,11 @@ class DisclaimerDialog(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         try:
-            self._opacity.setOpacity(0.0)
-            self._fade_in.start()
+            if getattr(self, '_no_animation', False):
+                self._opacity.setOpacity(1.0)
+            else:
+                self._opacity.setOpacity(0.0)
+                self._fade_in.start()
         except Exception:
             pass
 
@@ -151,6 +161,13 @@ class DisclaimerDialog(QWidget):
         if self._closing:
             return
         self._closing = True
+        # 性能模式：无动画直接关闭
+        if getattr(self, '_no_animation', False):
+            try:
+                self.close()
+            except Exception:
+                pass
+            return
         try:
             anim = QPropertyAnimation(self._opacity, b"opacity", self)
             anim.setDuration(int(duration_ms))
@@ -266,13 +283,3 @@ class DisclaimerDialog(QWidget):
         super().closeEvent(event)
 
 
-# For backwards compatibility
-def show_disclaimer(parent=None, icon_path=""):
-    dlg = DisclaimerDialog(icon_path=icon_path, parent=parent)
-    dlg.center_on_screen()
-    dlg.start_pulse()
-    dlg.show()
-    return dlg
-
-
-from PySide6.QtCore import QTimer

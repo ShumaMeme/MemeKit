@@ -15,6 +15,16 @@ class StartupSplash(QWidget):
         self._pulse_dir = 1.0
         self._closing = False
         self._light = bool(light)
+        self._vip = False
+        self._app_name = "MemeKit"
+
+        # 读取隐藏设置：VIP 状态
+        try:
+            from app.components.hidden_settings import is_vip_status_enabled
+            self._vip = is_vip_status_enabled()
+            self._app_name = "MemeKit"
+        except Exception:
+            pass
 
         self.setWindowFlags(
             Qt.FramelessWindowHint
@@ -22,7 +32,7 @@ class StartupSplash(QWidget):
             | Qt.Tool
         )
         self.setAttribute(Qt.WA_TranslucentBackground, True)
-
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
         self._pix = QPixmap(str(Path(icon_path))) if icon_path else QPixmap()
 
         root = QVBoxLayout(self)
@@ -31,12 +41,14 @@ class StartupSplash(QWidget):
 
         self.logo = QLabel(self)
         self.logo.setAlignment(Qt.AlignCenter)
+        self.logo.setAttribute(Qt.WA_TranslucentBackground, True)
         if not self._pix.isNull():
             self.logo.setPixmap(self._pix.scaled(QSize(176, 176), Qt.KeepAspectRatio, Qt.SmoothTransformation))
         root.addWidget(self.logo, 0, Qt.AlignHCenter)
 
-        self.title = QLabel("MemeKit", self)
+        self.title = QLabel(self._app_name, self)
         self.title.setAlignment(Qt.AlignCenter)
+        self.title.setAttribute(Qt.WA_TranslucentBackground, True)
         f = QFont()
         try:
             f.setPointSize(20)
@@ -45,9 +57,28 @@ class StartupSplash(QWidget):
             pass
         self.title.setFont(f)
         self.title.setStyleSheet(
-            "color: rgba(18, 18, 20, 230);" if self._light else "color: rgba(255, 255, 255, 235);"
+            "color: rgba(18, 18, 20, 230); background: transparent;" if self._light else "color: rgba(255, 255, 255, 235); background: transparent;"
         )
         root.addWidget(self.title)
+
+        # SVIP 问候语（仅在隐藏设置开启时显示）
+        if self._vip:
+            self.vip_label = QLabel("尊贵的SVIP用户，正在为您加速打开软件", self)
+        else:
+            self.vip_label = None
+        if self.vip_label is not None:
+            self.vip_label.setAlignment(Qt.AlignCenter)
+            fv = QFont()
+            try:
+                fv.setPointSize(10)
+                fv.setBold(True)
+            except Exception:
+                pass
+            self.vip_label.setFont(fv)
+            self.vip_label.setStyleSheet(
+                "color: rgba(200, 150, 0, 240); background: transparent;" if self._light else "color: rgba(255, 200, 80, 240); background: transparent;"
+            )
+            root.addWidget(self.vip_label)
 
         self.status = QLabel("正在启动...", self)
         self.status.setAlignment(Qt.AlignCenter)
@@ -58,7 +89,7 @@ class StartupSplash(QWidget):
             pass
         self.status.setFont(f2)
         self.status.setStyleSheet(
-            "color: rgba(18, 18, 20, 200);" if self._light else "color: rgba(255, 255, 255, 210);"
+            "color: rgba(18, 18, 20, 200); background: transparent;" if self._light else "color: rgba(255, 255, 255, 210); background: transparent;"
         )
         root.addWidget(self.status)
 
@@ -70,7 +101,14 @@ class StartupSplash(QWidget):
 
         self._pulse_timer = QTimer(self)
         self._pulse_timer.timeout.connect(self._tick_pulse)
-        self._pulse_timer.start(16)
+        self._pulse_timer.start(33)  # 30fps（原 16ms=60fps，降低重绘频率减少 CPU 占用）
+
+        # 性能模式下关闭弹窗淡入淡出动画
+        try:
+            from app.components.hidden_settings import is_dialog_animation_disabled
+            self._no_animation = is_dialog_animation_disabled()
+        except Exception:
+            self._no_animation = False
 
         self._opacity = QGraphicsOpacityEffect(self)
         self.setGraphicsEffect(self._opacity)
@@ -80,11 +118,15 @@ class StartupSplash(QWidget):
         self._fade_in.setStartValue(0.0)
         self._fade_in.setEndValue(1.0)
 
-        self.resize(520, 392)
+        self.resize(520, 440 if self._vip else 392)
 
         try:
-            self._opacity.setOpacity(0.0)
-            self._fade_in.start()
+            if self._no_animation:
+                # 无动画：直接显示
+                self._opacity.setOpacity(1.0)
+            else:
+                self._opacity.setOpacity(0.0)
+                self._fade_in.start()
         except Exception:
             pass
 
@@ -92,6 +134,13 @@ class StartupSplash(QWidget):
         if self._closing:
             return
         self._closing = True
+        # 性能模式：无动画直接关闭
+        if getattr(self, '_no_animation', False):
+            try:
+                self.close()
+            except Exception:
+                pass
+            return
         try:
             anim = QPropertyAnimation(self._opacity, b"opacity", self)
             anim.setDuration(int(duration_ms))
@@ -188,11 +237,11 @@ class StartupSplash(QWidget):
         cy = int(r.top() + r.height() * 0.38)
         rr = int(min(r.width(), r.height()) * (0.80 + 0.06 * self._pulse))
         if self._light:
-            a1 = int(92 + 88 * self._pulse)
-            a2 = int(24 + 36 * self._pulse)
+            a1 = int(80 + 60 * self._pulse)
+            a2 = int(20 + 30 * self._pulse)
         else:
-            a1 = int(140 + 110 * self._pulse)
-            a2 = int(42 + 48 * self._pulse)
+            a1 = int(120 + 80 * self._pulse)
+            a2 = int(35 + 35 * self._pulse)
         grad = QRadialGradient(cx, cy, rr)
         grad.setColorAt(0.0, QColor(42, 116, 218, a1))
         grad.setColorAt(0.42, QColor(42, 116, 218, a2))
@@ -203,7 +252,7 @@ class StartupSplash(QWidget):
         # subtle vignette
         v = QRadialGradient(cx, cy, int(min(r.width(), r.height()) * 0.95))
         v.setColorAt(0.0, QColor(0, 0, 0, 0))
-        v.setColorAt(1.0, QColor(0, 0, 0, 40 if self._light else 95))
+        v.setColorAt(1.0, QColor(0, 0, 0, 60 if self._light else 120))
         p.setBrush(v)
         p.drawRoundedRect(r, radius, radius)
 

@@ -7,23 +7,20 @@ from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
     QVBoxLayout,
-    QWidget,
     QLabel,
     QFileDialog,
-    QCheckBox,
 )
 from app.components.log_widget import LogWidget
 
 from qfluentwidgets import (
     CardWidget,
+    CheckBox,
     PrimaryPushButton,
     PushButton,
     TitleLabel,
     CaptionLabel,
     ComboBox,
-    SmoothScrollArea,
     LineEdit,
-    isDarkTheme,
 )
 
 from app.widgets.misc_tools.workers import FlashPartitionWorker
@@ -36,6 +33,13 @@ class _PartitionFlashDialog(QDialog):
         self.setWindowTitle("单分区刷入")
         self.fastboot_path = fastboot_path
         self._worker: Optional[QThread] = None
+        # 无边框 + 透明背景 + 毛玻璃样式
+        try:
+            from app.components.dialog_styles import dialog_stylesheet, setup_dialog_window
+            setup_dialog_window(self)
+            self.setStyleSheet(dialog_stylesheet())
+        except Exception:
+            pass
 
         layout = QVBoxLayout(self)
         try:
@@ -69,7 +73,7 @@ class _PartitionFlashDialog(QDialog):
         self.slot_combo.addItems(["不指定", "_a", "_b"])
         self.mode_combo = ComboBox(self)
         self.mode_combo.addItems(["bootloader", "fastbootd"])
-        self.auto_switch = QCheckBox("自动切换模式")
+        self.auto_switch = CheckBox("自动切换模式")
         self.auto_switch.setChecked(True)
         row1.addWidget(QLabel("分区"))
         row1.addWidget(self.part_edit)
@@ -114,10 +118,12 @@ class _PartitionFlashDialog(QDialog):
 
     def refresh_theme(self):
         """主题切换时刷新内部组件的样式。"""
-        if isDarkTheme():
-            self.setStyleSheet("")
-        else:
-            self.setStyleSheet("QDialog { background-color: #F0E6F6; }")
+        try:
+            from app.components.dialog_styles import dialog_stylesheet
+            self.setStyleSheet(dialog_stylesheet())
+        except Exception:
+            # fallback: 透明背景，让模糊层透出
+            self.setStyleSheet("QDialog { background: transparent; }")
         try:
             if hasattr(self.out, "refresh_theme"):
                 self.out.refresh_theme()
@@ -128,8 +134,18 @@ class _PartitionFlashDialog(QDialog):
         path, _ = QFileDialog.getOpenFileName(self, "选择镜像", "", "镜像 (*.img);;所有文件 (*.*)")
         if path:
             self.img_edit.setText(path)
+            try:
+                from app.services import log_service
+                log_service.log_file_event("选择", path)
+            except Exception:
+                pass
 
     def _flash_partition(self):
+        try:
+            from app.services import log_service
+            log_service.log_ui_action("单分区刷入", self.part_edit.text().strip())
+        except Exception:
+            pass
         img = self.img_edit.text().strip()
         part = self.part_edit.text().strip()
         if not img or not os.path.isfile(img):
@@ -234,6 +250,15 @@ class _PartitionFlashDialog(QDialog):
 
     def _on_finished(self, code: int):
         """在主线程中安全清理 worker（线程已完成，wait 立即返回）。"""
+        try:
+            from app.services import log_service
+            part = self.part_edit.text().strip() if hasattr(self, 'part_edit') else ''
+            if code == 0:
+                log_service.log_operation("单分区刷入", success=True, detail=f"分区={part}")
+            else:
+                log_service.log_operation("单分区刷入", success=False, detail=f"分区={part} code={code}")
+        except Exception:
+            pass
         try:
             if self._worker:
                 self._worker.quit()

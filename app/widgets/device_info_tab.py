@@ -26,15 +26,18 @@ from app.components.blur_popup import show_blur_custom
 
 class _RefreshThread(QThread):
     """后台线程：执行 ADB 设备信息采集，避免阻塞 UI。"""
-    def __init__(self, parent=None):
+    def __init__(self, serial: str = "", parent=None):
         super().__init__(parent)
         self._info = {}
         self._mode = ""
         self._serial = ""
+        self._target_serial = str(serial or "")
+        self._all_serials = []  # 所有在线设备 serial 列表，供主线程更新 selector
+        self._all_devices_with_mode = []  # [(serial, mode), ...] 用于显示模式标识
 
     def run(self):
         try:
-            self._info = adb_service.collect_overall_info()
+            self._info = adb_service.collect_overall_info(serial=self._target_serial)
         except Exception:
             self._info = {}
         self._mode = str(self._info.get("connection_status", "") or "")
@@ -44,6 +47,14 @@ class _RefreshThread(QThread):
                 self._mode, self._serial = adb_service.detect_connection_mode()
             except Exception:
                 self._mode, self._serial = "", ""
+        # 在后台线程获取设备列表，避免主线程调用 list_devices 阻塞 UI
+        # 使用 list_all_devices_with_mode 获取带模式标识的设备列表
+        try:
+            self._all_devices_with_mode = adb_service.list_all_devices_with_mode()
+            self._all_serials = [s for s, _ in self._all_devices_with_mode]
+        except Exception:
+            self._all_devices_with_mode = []
+            self._all_serials = []
 
 
 class StatsRingWidget(QWidget):
@@ -132,7 +143,8 @@ class _WatchTickThread(QThread):
     def run(self):
         try:
             mode, serial = adb_service.detect_connection_mode()
-            devs = adb_service.list_devices()
+            # 使用 list_all_devices 包含 Fastboot 模式设备，确保状态变化检测准确
+            devs = adb_service.list_all_devices()
             self._state = f"{mode}:{serial}:{','.join(devs or [])}"
         except Exception:
             self._state = None
@@ -208,9 +220,15 @@ class _DriverInstallWorker(QObject):
 
 
 class DeviceInfoTab(QWidget):
+    # 当用户在仪表盘切换设备时发出，参数为设备 serial（空字符串表示未选择）
+    device_selected = Signal(str)
+
     def __init__(self):
         super().__init__()
         self._msg_boxes = []
+        self._current_selected_serial = ""
+        # 标志位：区分程序触发下拉框更新和用户手动切换
+        self._programmatic_selector_update = False
         self._watch_timer = None
         self._watch_tick_thread = None
         self._wifi_thread = None
@@ -220,13 +238,16 @@ class DeviceInfoTab(QWidget):
         self._last_conn_banner = None
         self._did_first_show = False
         self._loading_infobar = None
+        self._retry_count = 0          # 启动重试计数
+        self._device_found = False     # 首次检测到设备后取消后续重试
+        self._pending_refresh = False  # 待刷新标记：线程忙时排队请求
+        self._update_worker = None     # 更新检查工作线程引用
 
         self._init_ui()
         self._connect_signals()
-        # 安全网：打包后 ADB 服务启动较慢，多次重试确保检测到设备
-        QTimer.singleShot(1500, self.refresh)
-        QTimer.singleShot(4000, self.refresh)
-        QTimer.singleShot(8000, self.refresh)
+        # 安全网：打包后 ADB 服务启动较慢，指数退避重试确保检测到设备
+        # 首次成功检测到设备后自动取消后续重试，避免冗余 ADB 查询
+        self._schedule_retry(1500)
 
     def _init_ui(self):
         self.v_layout = QVBoxLayout(self)
@@ -237,12 +258,12 @@ class DeviceInfoTab(QWidget):
         self.v_layout.addWidget(self.scroll)
 
         self.container = QWidget()
-        self.container.setStyleSheet("QWidget {background: transparent;}")
+        self.container.setStyleSheet("background: transparent;")
         self.scroll.setWidget(self.container)
 
         self.layout = QVBoxLayout(self.container)
         self.layout.setContentsMargins(20, 20, 20, 20)
-        self.layout.setSpacing(16)
+        self.layout.setSpacing(24)
 
         self._build_hero_card()
         self._build_rings_row()
@@ -256,10 +277,108 @@ class DeviceInfoTab(QWidget):
         # 每次显示时都触发一次刷新，确保从其他 TAB 切回来时数据是最新的
         QTimer.singleShot(50, self.refresh)
         if self._did_first_show:
+            # 性能优化：Tab 重新可见时恢复 watch_timer（在 hideEvent 中停止过）
+            try:
+                if self._watch_timer is not None and not self._watch_timer.isActive():
+                    self._watch_timer.start(2500)
+            except Exception:
+                pass
             return
         self._did_first_show = True
         try:
             self._start_watcher()
+        except Exception:
+            pass
+        # 首次显示仪表盘后异步检查更新（延迟 3s，避免阻塞启动 UI）
+        QTimer.singleShot(3000, self._check_for_updates)
+
+    def hideEvent(self, event):
+        """性能优化：Tab 隐藏时停止设备轮询定时器，避免后台 ADB 调用消耗 CPU。
+
+        根因分析：watch_timer 每 2500ms 创建 _WatchTickThread 执行 ADB 调用，
+        即使 Tab 不可见也持续运行。未连接设备时，ADB 子进程启动开销大，
+        周期性 CPU 峰值与 TAB 切换重绘叠加 → 掉帧。
+        """
+        try:
+            if hasattr(self, '_watch_timer') and self._watch_timer is not None:
+                if self._watch_timer.isActive():
+                    self._watch_timer.stop()
+        except Exception:
+            pass
+        try:
+            super().hideEvent(event)
+        except Exception:
+            pass
+
+    def _check_for_updates(self):
+        """异步检查 GitHub 最新 release，若有新版本则弹窗提醒。
+
+        规则：
+          - 网络请求在工作线程中执行，不阻塞 UI；
+          - 远程版本严格大于当前版本才弹窗；
+          - 同一版本每天最多提醒一次（记忆功能）。
+        """
+        try:
+            from app.version import VERSION
+            from app.services.update_checker import (
+                GitHubReleaseWorker, is_newer, should_remind_today,
+            )
+            from app.components.update_dialog import show_update_available
+            from app.services import log_service
+            try:
+                log_service.log_ui_action("启动检查更新", f"当前版本 {VERSION}")
+            except Exception:
+                pass
+
+            worker = GitHubReleaseWorker(VERSION, parent=self)
+
+            def _on_result(info: dict, error: str):
+                try:
+                    if error:
+                        log_service.log_error("检查更新", f"请求失败: {error}")
+                        return
+                    if not info:
+                        log_service.log_error("检查更新", "返回数据为空")
+                        return
+                    remote_ver = info.get("version", "")
+                    if not remote_ver:
+                        log_service.log_error("检查更新", "未获取到版本号")
+                        return
+                    # 当前版本 >= 新版本：不提醒
+                    if not is_newer(remote_ver, VERSION):
+                        try:
+                            log_service.get_logger("UPDATE").info(
+                                f"检查更新完成：已是最新版本 {VERSION}（远程 {remote_ver}）"
+                            )
+                        except Exception:
+                            pass
+                        return
+                    # 同版本今日已提醒：不再提醒
+                    if not should_remind_today(remote_ver):
+                        try:
+                            log_service.get_logger("UPDATE").info(
+                                f"发现新版本 {remote_ver}，今日已提醒过，跳过弹窗"
+                            )
+                        except Exception:
+                            pass
+                        return
+                    try:
+                        log_service.get_logger("UPDATE").info(
+                            f"发现新版本 {remote_ver}，准备弹出更新提醒"
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        show_update_available(self.window(), info, VERSION)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            worker.result_ready.connect(_on_result)
+            # 持有引用避免被 GC
+            self._update_worker = worker
+            worker.start()
         except Exception:
             pass
 
@@ -410,7 +529,7 @@ class DeviceInfoTab(QWidget):
         ]
         sys_items = [
             ("android_version", "Android版本"), ("sdk", "SDK版本"),
-            ("kernel", "内核版本"), ("vndk", "VNDK版本"),
+            ("kernel", "内核版本"), ("build_display", "详细版本号"),
             ("bootloader_unlock", "Bootloader状态"), ("root_status", "Root权限"),
             ("current_slot", "当前A/B槽位"), ("uptime", "本次开机时间")
         ]
@@ -522,23 +641,51 @@ class DeviceInfoTab(QWidget):
         self.layout.addWidget(self.action_row_widget)
 
     def _connect_signals(self):
-        self.btn_refresh.clicked.connect(self.refresh)
+        self.btn_refresh.clicked.connect(self._on_refresh_clicked)
         self.btn_reboot_exec.clicked.connect(self._do_selected_reboot)
         self.btn_run_tool.clicked.connect(self._run_selected_tool)
         self.device_selector.currentTextChanged.connect(self._on_device_selector_changed)
 
+    def _on_refresh_clicked(self):
+        try:
+            from app.services import log_service
+            log_service.log_ui_action("仪表盘-刷新设备")
+        except Exception:
+            pass
+        self.refresh()
+
+    def _schedule_retry(self, delay_ms: int):
+        """指数退避重试：1500→3000→6000ms，最多3次，首次检测到设备后取消。"""
+        if self._device_found or self._retry_count >= 3:
+            return
+        self._retry_count += 1
+        QTimer.singleShot(delay_ms, self._retry_refresh)
+
+    def _retry_refresh(self):
+        """启动重试刷新，结果在 _on_refresh_finished 中检查。"""
+        if self._device_found:
+            return
+        self.refresh()
+
     def refresh(self):
-        """使用后台线程执行 ADB 设备信息采集，避免阻塞 UI。"""
+        """使用后台线程执行 ADB 设备信息采集，避免阻塞 UI。
+
+        若已有刷新线程在运行，则标记 _pending_refresh，待当前完成后自动重试，
+        避免用户切换设备时刷新请求被静默丢弃。
+        """
         old = getattr(self, '_refresh_thread', None)
         if old is not None:
             if old.isRunning():
+                # 标记待刷新：当前线程完成后会自动触发一次新刷新
+                self._pending_refresh = True
                 return
             try:
                 old.finished.disconnect(self._on_refresh_finished)
             except Exception:
                 pass
 
-        self._refresh_thread = _RefreshThread(self)
+        self._pending_refresh = False
+        self._refresh_thread = _RefreshThread(serial=self._current_selected_serial, parent=self)
         self._refresh_thread.finished.connect(self._on_refresh_finished, Qt.QueuedConnection)
         self._refresh_thread.start()
 
@@ -552,13 +699,48 @@ class DeviceInfoTab(QWidget):
         mode = str(t._mode or "")
         serial = str(t._serial or "")
         status_line = str(info.get("status_line", "") or "未发现已连接设备")
-        status_color = str(info.get("status_color", "") or "#86909c")
         banner_state = str(info.get("banner_state", "") or "")
+
+        # 首次检测到设备后取消后续启动重试
+        if mode and mode not in ("none", "offline", ""):
+            self._device_found = True
+            self._retry_count = 0
+        else:
+            # 设备重启后 _device_found 仍为 True，需重置以允许重试
+            self._device_found = False
+            # 竞态条件修复：collect_overall_info 返回"断开"但 list_all_devices 检测到设备在线
+            # 说明设备刚好在 collect_overall_info 之后、list_all_devices 之前恢复连接
+            # 此时应立即重试刷新，而非等待 watcher 触发
+            preloaded = getattr(t, '_all_serials', None) or []
+            target_serial = str(t._target_serial or "")
+            if preloaded and mode in ("none", ""):
+                # 关键：若用户选中的设备仍在在线列表中，保持选择不切换，只重试
+                # 避免覆盖用户在设备选择器中的显式选择
+                if target_serial and target_serial in preloaded:
+                    # 用户选中的设备仍在线，只需重试（可能是 fastboot 命令超时等临时失败）
+                    if self._retry_count < 3:
+                        self._retry_count += 1
+                        QTimer.singleShot(800, self.refresh)
+                else:
+                    # 用户选中的设备确实不在线，切换到第一台可用设备
+                    online_serial = preloaded[0]
+                    self._current_selected_serial = online_serial
+                    self._retry_count = 0
+                    try:
+                        self.device_selected.emit(online_serial)
+                    except Exception:
+                        pass
+                    if self._retry_count < 3:
+                        self._retry_count += 1
+                        QTimer.singleShot(800, self.refresh)
+            else:
+                self._schedule_retry(max(1500, 1500 * (2 ** self._retry_count)))
 
         try:
             banner_key = (banner_state, mode, serial)
             last_key = getattr(self, "_last_conn_banner", None)
             last_mode = last_key[1] if isinstance(last_key, tuple) and len(last_key) >= 2 else ""
+            last_serial = last_key[2] if isinstance(last_key, tuple) and len(last_key) >= 3 else ""
             if self._did_first_show and last_key is not None and banner_key != last_key:
                 if mode in ("system", "sideload") and last_mode not in ("system", "sideload"):
                     InfoBar.success(
@@ -569,6 +751,16 @@ class DeviceInfoTab(QWidget):
                         duration=2200,
                         isClosable=True,
                     )
+                    try:
+                        from app.services import log_service
+                        log_service.log_device_event("连接", serial=serial, mode=mode)
+                        # 记录设备详细信息（品牌、型号、Android版本、槽位等）
+                        device_info = dict(t._info or {})
+                        device_info["mode"] = mode
+                        device_info["serial"] = serial
+                        log_service.log_device_info(device_info)
+                    except Exception:
+                        pass
                 elif mode in ("fastbootd", "bootloader", "edl", "brom"):
                     InfoBar.info(
                         "设备模式变化",
@@ -578,6 +770,16 @@ class DeviceInfoTab(QWidget):
                         duration=2200,
                         isClosable=True,
                     )
+                    try:
+                        from app.services import log_service
+                        log_service.log_device_event("模式切换", serial=serial, mode=mode)
+                        # 记录模式切换后的设备信息（fastboot 模式下的产品、解锁状态等）
+                        device_info = dict(t._info or {})
+                        device_info["mode"] = mode
+                        device_info["serial"] = serial
+                        log_service.log_device_info(device_info)
+                    except Exception:
+                        pass
                 elif mode == "offline":
                     InfoBar.warning(
                         "设备未授权",
@@ -587,6 +789,11 @@ class DeviceInfoTab(QWidget):
                         duration=2600,
                         isClosable=True,
                     )
+                    try:
+                        from app.services import log_service
+                        log_service.log_device_event("未授权", serial=serial, mode=mode)
+                    except Exception:
+                        pass
                 elif mode == "none":
                     InfoBar.warning(
                         "设备已断开",
@@ -596,12 +803,20 @@ class DeviceInfoTab(QWidget):
                         duration=2000,
                         isClosable=True,
                     )
+                    try:
+                        from app.services import log_service
+                        log_service.log_device_event("断开", serial=last_serial, mode=last_mode)
+                    except Exception:
+                        pass
             self._last_conn_banner = banner_key
         except Exception:
             pass
 
         try:
-            self._refresh_device_selector(serial)
+            # 传入后台线程预取的设备列表，避免主线程调用 list_devices 阻塞 UI
+            preloaded = getattr(t, '_all_serials', None) or []
+            preloaded_with_mode = getattr(t, '_all_devices_with_mode', None) or []
+            self._refresh_device_selector(serial, preloaded_serials=preloaded, preloaded_devices_with_mode=preloaded_with_mode)
         except Exception:
             pass
 
@@ -702,12 +917,53 @@ class DeviceInfoTab(QWidget):
                 pass
         if getattr(self, '_pending_refresh', False):
             self._pending_refresh = False
-            QTimer.singleShot(500, self.refresh)
+            # 延迟 1 秒重试，避免快速循环
+            QTimer.singleShot(1000, self.refresh)
 
     def _on_device_selector_changed(self, text):
-        pass
+        """用户切换设备选择器时，提取 serial 并广播给所有 tab，同时刷新仪表盘。"""
+        # 程序触发更新下拉框时跳过，避免循环
+        if self._programmatic_selector_update:
+            return
+        serial = self._extract_serial_from_text(text)
+        if serial and serial != self._current_selected_serial:
+            self._current_selected_serial = serial
+            # 广播给其他 tab
+            try:
+                self.device_selected.emit(serial)
+            except Exception:
+                pass
+            # 刷新仪表盘自身以显示新选中的设备信息
+            try:
+                self.refresh()
+            except Exception:
+                pass
+
+    def _extract_serial_from_text(self, text: str) -> str:
+        """从 device_selector 的文本中提取 serial。
+
+        item 格式可能是:
+        - "serial123" (普通)
+        - "serial123 (系统)" (带状态)
+        - "未检测到设备"
+        """
+        t = str(text or "").strip()
+        if not t or t == "未检测到设备":
+            return ""
+        # 截断括号及之后内容
+        for sep in (" (", "(", " "):
+            idx = t.find(sep)
+            if idx > 0:
+                t = t[:idx]
+                break
+        return t.strip()
 
     def _run_selected_tool(self):
+        try:
+            from app.services import log_service
+            log_service.log_ui_action("仪表盘-工具", self.tool_selector.currentText())
+        except Exception:
+            pass
         text = self.tool_selector.currentText()
         if text == "ADB 终端":
             self._open_adb_terminal()
@@ -820,7 +1076,12 @@ class DeviceInfoTab(QWidget):
 
     def _refresh_device_selector_with_data(self, current_serial: str, current_mode: str, serials: list):
         """使用后台线程已采集的设备列表更新选择器，不调用任何 ADB 函数。"""
-        selected = current_serial or ""
+        # 优先保持用户已选择的设备
+        selected = self._current_selected_serial or current_serial or ""
+        if selected and serials and selected not in serials:
+            selected = serials[0]
+        if not selected and serials:
+            selected = serials[0]
         items = []
         if selected and selected not in serials:
             items.append(f"{selected} ({self._cn_connection(current_mode) or '当前'})")
@@ -829,66 +1090,131 @@ class DeviceInfoTab(QWidget):
         if not items:
             items = ["未检测到设备"]
 
+        # 程序触发更新，暂时屏蔽 currentTextChanged 信号
+        self._programmatic_selector_update = True
         try:
-            self.device_selector.clear()
-        except Exception:
-            pass
-        try:
-            self.device_selector.addItems(items)
-        except Exception:
-            for item in items:
-                self.device_selector.addItem(item)
-        try:
-            idx = 0
-            if selected:
-                for i, item in enumerate(items):
-                    if item.startswith(selected):
-                        idx = i
-                        break
-            self.device_selector.setCurrentIndex(idx)
-        except Exception:
-            pass
+            try:
+                self.device_selector.clear()
+            except Exception:
+                pass
+            try:
+                self.device_selector.addItems(items)
+            except Exception:
+                for item in items:
+                    self.device_selector.addItem(item)
+            try:
+                idx = 0
+                if selected:
+                    for i, item in enumerate(items):
+                        if item.startswith(selected):
+                            idx = i
+                            break
+                self.device_selector.setCurrentIndex(idx)
+            except Exception:
+                pass
+        finally:
+            self._programmatic_selector_update = False
 
-    def _refresh_device_selector(self, current_serial: str = ""):
-        try:
-            serials = adb_service.list_devices()
-        except Exception:
-            serials = []
-        try:
-            mode, detected_serial = adb_service.detect_connection_mode()
-        except Exception:
-            mode, detected_serial = "", ""
+        # 广播当前选中的 serial 给所有 tab
+        if selected != self._current_selected_serial:
+            self._current_selected_serial = selected
+            try:
+                self.device_selected.emit(selected)
+            except Exception:
+                pass
+            try:
+                from app.services import log_service
+                log_service.log_device_event("选择", serial=selected)
+            except Exception:
+                pass
 
-        selected = current_serial or detected_serial or ""
+    def _refresh_device_selector(self, current_serial: str = "", preloaded_serials: list = None, preloaded_devices_with_mode: list = None):
+        """刷新设备选择器下拉框。
+
+        Args:
+            current_serial: 当前刷新的设备 serial
+            preloaded_serials: 预取的在线设备 serial 列表，避免主线程调用 list_devices 阻塞 UI
+            preloaded_devices_with_mode: 预取的 [(serial, mode), ...] 列表，用于显示模式标识
+        """
+        # 获取带模式标识的设备列表
+        if preloaded_devices_with_mode is not None:
+            devices_with_mode = list(preloaded_devices_with_mode)
+        elif preloaded_serials is not None:
+            # 只有 serial 列表，无模式信息，用空模式占位
+            devices_with_mode = [(s, "") for s in preloaded_serials]
+        else:
+            try:
+                devices_with_mode = adb_service.list_all_devices_with_mode()
+            except Exception:
+                devices_with_mode = []
+
+        serials = [s for s, _ in devices_with_mode]
+
+        # 优先保持用户已选择的设备；仅在未选择时回退到自动检测
+        selected = self._current_selected_serial or current_serial or ""
+        # 如果用户已选择的设备已不在列表中，则切换到第一台可用设备
+        if selected and serials and selected not in serials:
+            selected = serials[0]
+        if not selected and serials:
+            selected = serials[0]
+
+        # 构造显示项：serial + 模式标识（如 "serial (Fastbootd)"）
+        def _format_item(s: str, m: str = "") -> str:
+            cn = self._cn_connection(m) if m else ""
+            return f"{s} ({cn})" if cn else s
+
         items = []
         if selected and selected not in serials:
-            items.append(f"{selected} ({self._cn_connection(mode) or '当前'})")
-        for s in serials:
-            items.append(s)
+            items.append(f"{selected} (当前)")
+        for s, m in devices_with_mode:
+            items.append(_format_item(s, m))
         if not items:
             items = ["未检测到设备"]
 
+        # 程序触发更新，暂时屏蔽 currentTextChanged 信号
+        self._programmatic_selector_update = True
         try:
-            self.device_selector.clear()
-        except Exception:
-            pass
-        try:
-            self.device_selector.addItems(items)
-        except Exception:
-            for item in items:
-                self.device_selector.addItem(item)
-        try:
-            idx = 0
-            if selected:
-                for i, item in enumerate(items):
-                    if item.startswith(selected):
-                        idx = i
-                        break
-            self.device_selector.setCurrentIndex(idx)
-        except Exception:
-            pass
+            try:
+                self.device_selector.clear()
+            except Exception:
+                pass
+            try:
+                self.device_selector.addItems(items)
+            except Exception:
+                for item in items:
+                    self.device_selector.addItem(item)
+            try:
+                idx = 0
+                if selected:
+                    for i, item in enumerate(items):
+                        if item.startswith(selected):
+                            idx = i
+                            break
+                self.device_selector.setCurrentIndex(idx)
+            except Exception:
+                pass
+        finally:
+            self._programmatic_selector_update = False
+
+        # 广播当前选中的 serial 给所有 tab
+        if selected != self._current_selected_serial:
+            self._current_selected_serial = selected
+            try:
+                self.device_selected.emit(selected)
+            except Exception:
+                pass
+            try:
+                from app.services import log_service
+                log_service.log_device_event("选择", serial=selected)
+            except Exception:
+                pass
 
     def _do_selected_reboot(self):
+        try:
+            from app.services import log_service
+            log_service.log_ui_action("仪表盘-重启", self.reboot_mode_combo.currentText())
+        except Exception:
+            pass
         try:
             text = str(self.reboot_mode_combo.currentText() or "").strip()
         except Exception:
@@ -903,37 +1229,149 @@ class DeviceInfoTab(QWidget):
         self._do_reboot(mapping.get(text, "system"))
 
     def _do_reboot(self, target: str):
+        # 多设备时必须传递当前选中的 serial，否则 adb 会重启第一台设备
+        current_serial = getattr(self, '_current_selected_serial', '') or ''
+
         class Worker(QObject):
-            finished = Signal()
-            def __init__(self, t: str):
+            finished = Signal(bool, str)
+            def __init__(self, t: str, ser: str):
                 super().__init__()
                 self.t = t
+                self.ser = ser
             def run(self):
+                ok, msg = False, ""
                 try:
-                    adb_service.reboot_to(self.t)
-                except Exception:
-                    pass
+                    ok, msg = adb_service.reboot_to(self.t, self.ser)
+                except Exception as e:
+                    ok, msg = False, f"执行异常: {e}"
                 try:
-                    self.finished.emit()
+                    self.finished.emit(bool(ok), str(msg or ""))
                 except Exception:
                     pass
 
+        # 根据是否有选中设备给出更明确的提示
+        if current_serial:
+            hint = f"正在向设备 {current_serial} 发送重启指令..."
+        else:
+            hint = "正在发送重启指令..."
         try:
-            InfoBar.info("提示", "重启指令已发送", parent=self, position=InfoBarPosition.TOP, duration=2000, isClosable=True)
+            InfoBar.info("提示", hint, parent=self, position=InfoBarPosition.TOP, duration=2000, isClosable=True)
         except Exception:
             pass
 
         self._thread2 = QThread(self)
-        self._worker2 = Worker(target)
+        self._worker2 = Worker(target, current_serial)
         self._worker2.moveToThread(self._thread2)
         self._thread2.started.connect(self._worker2.run)
+
         try:
+            # 关键：必须连接到 self 的方法（非闭包），PySide6 才能通过 self 判断接收者线程
+            # 闭包没有 QObject 归属，QueuedConnection 会退化为 DirectConnection
+            # 导致回调在 Worker 线程执行 GUI 操作（InfoBar），造成 Qt 死锁
+            self._worker2.finished.connect(self._on_reboot_finished, Qt.QueuedConnection)
             self._worker2.finished.connect(self._thread2.quit)
             self._worker2.finished.connect(self._worker2.deleteLater)
             self._thread2.finished.connect(self._thread2.deleteLater)
         except Exception:
             pass
         self._thread2.start()
+
+        # 重启指令发送后，延迟 3 秒（给设备关机时间）切换到其他在线设备
+        # 多设备场景：选中的设备重启后应自动切换到第二台设备
+        # 单设备场景：没有其他设备则继续显示当前设备（已断开状态）
+        try:
+            QTimer.singleShot(3000, self._switch_after_reboot)
+        except Exception:
+            pass
+
+    def _switch_after_reboot(self):
+        """重启后自动切换到其他在线设备，并刷新仪表盘。
+
+        使用后台线程执行 list_all_devices 避免阻塞 UI（设备断开时 ADB 可能阻塞 14s+）。
+        使用 list_all_devices 包含 Fastboot 模式设备，确保能切换到处于 Bootloader 的设备。
+        """
+        # 存储为实例变量，供 _on_switch_finished 方法使用
+        self._rebooted_serial = str(self._current_selected_serial or "")
+        rebooted_serial = self._rebooted_serial
+
+        class _SwitchWorker(QObject):
+            finished = Signal(list)
+            def run(self):
+                try:
+                    devs = adb_service.list_all_devices()
+                except Exception:
+                    devs = []
+                # 排除正在重启的设备
+                other = [s for s in (devs or []) if s != rebooted_serial]
+                self.finished.emit(other)
+
+        self._switch_thread = QThread(self)
+        self._switch_worker = _SwitchWorker()
+        self._switch_worker.moveToThread(self._switch_thread)
+        self._switch_thread.started.connect(self._switch_worker.run)
+
+        try:
+            # 关键：连接到 self 方法（非闭包），QueuedConnection 才能正确投递到主线程
+            self._switch_worker.finished.connect(self._on_switch_finished, Qt.QueuedConnection)
+            self._switch_worker.finished.connect(self._switch_worker.deleteLater)
+            self._switch_thread.finished.connect(self._switch_thread.deleteLater)
+        except Exception:
+            pass
+        self._switch_thread.start()
+
+    def _on_reboot_finished(self, ok: bool, msg: str):
+        """重启指令执行完成回调（必须在主线程执行，由 QueuedConnection 保证）。"""
+        try:
+            if ok:
+                InfoBar.success("重启成功", msg or "重启指令已发送", parent=self,
+                                position=InfoBarPosition.TOP, duration=3000, isClosable=True)
+            else:
+                InfoBar.error("重启失败", msg or "重启指令执行失败", parent=self,
+                              position=InfoBarPosition.TOP, duration=4000, isClosable=True)
+        except Exception:
+            pass
+
+    def _on_switch_finished(self, other_serials: list):
+        """重启后设备切换回调（必须在主线程执行，由 QueuedConnection 保证）。"""
+        rebooted_serial = getattr(self, '_rebooted_serial', '')
+        try:
+            self._switch_thread.quit()
+        except Exception:
+            pass
+
+        if other_serials:
+            # 有其他在线设备，自动切换到第一台
+            new_serial = other_serials[0]
+            try:
+                InfoBar.info(
+                    "已切换设备",
+                    f"设备 {rebooted_serial} 正在重启，已切换到 {new_serial}",
+                    parent=self, position=InfoBarPosition.TOP, duration=3000, isClosable=True,
+                )
+            except Exception:
+                pass
+            # 更新当前选中设备并刷新（refresh 内部会更新 selector）
+            self._current_selected_serial = new_serial
+            try:
+                self.device_selected.emit(new_serial)
+            except Exception:
+                pass
+        else:
+            # 没有其他在线设备，提示等待
+            try:
+                InfoBar.info(
+                    "等待设备重启",
+                    f"设备 {rebooted_serial} 正在重启中，请等待其重新上线...",
+                    parent=self, position=InfoBarPosition.TOP, duration=3000, isClosable=True,
+                )
+            except Exception:
+                pass
+
+        # 刷新一次（collect_overall_info 对断开设备会快速返回）
+        try:
+            self.refresh()
+        except Exception:
+            pass
 
     def _resolve_donate_img(self) -> str:
         try:
@@ -966,6 +1404,11 @@ class DeviceInfoTab(QWidget):
             show_blur_custom(self.window(), mb)
 
     def _on_install_driver(self):
+        try:
+            from app.services import log_service
+            log_service.log_ui_action("仪表盘-安装Fastboot驱动")
+        except Exception:
+            pass
         from app import get_project_root
         driver_path = str(get_project_root() / 'bin' / 'fastboot_driver_64.exe')
         if not os.path.exists(driver_path):

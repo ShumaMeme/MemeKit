@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, Signal, QMimeData, QPoint, QThread, QObject
+from PySide6.QtCore import Qt, Signal, QMimeData, QPoint, QThread
 from PySide6.QtGui import QDrag, QPixmap, QPainter, QPen
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
@@ -13,83 +13,37 @@ from PySide6.QtWidgets import (
 from qfluentwidgets import (
     CardWidget, PrimaryPushButton, PushButton, FluentIcon,
     InfoBar, InfoBarPosition, SmoothScrollArea, CaptionLabel,
-    BodyLabel, SubtitleLabel, StrongBodyLabel, TitleLabel,
-    isDarkTheme, ThemeColor, qconfig,
+    StrongBodyLabel, TitleLabel, isDarkTheme,
+    ThemeColor, qconfig,
 )
 
 from app.services import adb_service as svc
 from app.components.log_widget import LogWidget
 from app.components.blur_popup import show_blur_custom, show_blur_info
-
-
-def _dialog_stylesheet() -> str:
-    """弹窗样式：浅紫色主题，跟随系统主题切换。"""
-    if isDarkTheme():
-        bg = "#F3D3E7"
-        card = "#FFFFFF"
-        text = "#1D1B20"
-        border = "#E8C0D5"
-        input_bg = "#FFFFFF"
-    else:
-        bg = "#F7F0FC"
-        card = "#ffffff"
-        text = "#1D1B20"
-        border = "#E0D4EC"
-        input_bg = "#ffffff"
-    return f"""
-        QDialog {{
-            background-color: {bg};
-            color: {text};
-        }}
-        CardWidget {{
-            background-color: {card};
-            color: {text};
-            border: 1px solid {border};
-            border-radius: 10px;
-        }}
-        QLineEdit {{
-            background-color: {input_bg};
-            color: {text};
-            border: 1px solid {border};
-            border-radius: 6px;
-            padding: 8px 10px;
-            selection-background-color: #2A74DA;
-            selection-color: #ffffff;
-        }}
-        QLineEdit:focus {{
-            border: 1px solid #2A74DA;
-        }}
-        QLabel, TitleLabel, CaptionLabel, BodyLabel, SubtitleLabel, StrongBodyLabel {{
-            color: {text};
-            background: transparent;
-        }}
-    """
+from app.components.dialog_styles import dialog_stylesheet
+from app.components.glass_style import apply_banner_style, refresh_banner_style
 
 
 def _card_style(selected: bool) -> str:
     """卡片基础样式：背景由 paintEvent 绘制，此处仅保留透明底色。"""
-    return "QWidget { background: transparent; }"
+    return "background: transparent;"
 
 
 def _code_block_style() -> str:
-    """代码块样式：独立容器，圆角背景，等宽字体。"""
+    """代码块样式：独立容器，圆角背景，等宽字体。半透明让毛玻璃透出。"""
     if isDarkTheme():
         return (
-            "QWidget {"
-            "  background-color: #24243A;"
-            "  border: 1px solid #313244;"
-            "  border-radius: 8px;"
-            "  padding: 8px 10px;"
-            "}"
+            "background-color: rgba(36, 36, 58, 0.85);"
+            "border: 1px solid rgba(255, 255, 255, 0.08);"
+            "border-radius: 8px;"
+            "padding: 8px 10px;"
         )
     else:
         return (
-            "QWidget {"
-            "  background-color: #F4F4F9;"
-            "  border: 1px solid #E8E6F0;"
-            "  border-radius: 8px;"
-            "  padding: 8px 10px;"
-            "}"
+            "background-color: rgba(244, 244, 249, 0.85);"
+            "border: 1px solid rgba(42, 116, 218, 0.10);"
+            "border-radius: 8px;"
+            "padding: 8px 10px;"
         )
 
 
@@ -100,7 +54,7 @@ def _cmd_text_color() -> str:
 def _name_text_color(selected: bool = False) -> str:
     if isDarkTheme():
         if selected:
-            return "#1E1E30"  # 深色文字，在浅粉色背景上清晰可见
+            return "#1A2A40"  # 深色文字，在浅蓝色背景上清晰可见
         return "#E4E4E7"  # 更亮的灰色，提高可读性
     else:
         return "#1E293B"
@@ -111,7 +65,7 @@ def _mode_tag_style() -> str:
     if isDarkTheme():
         return (
             "QLabel {"
-            "  background-color: #313244;"
+            "  background-color: #2A3F5C;"
             "  color: #A6E3A1;"
             "  border-radius: 4px;"
             "  padding: 2px 8px;"
@@ -122,8 +76,8 @@ def _mode_tag_style() -> str:
     else:
         return (
             "QLabel {"
-            "  background-color: #EDE9FE;"
-            "  color: #6D28D9;"
+            "  background-color: #E3F0FF;"
+            "  color: #2A74DA;"
             "  border-radius: 4px;"
             "  padding: 2px 8px;"
             "  font-size: 11px;"
@@ -282,13 +236,20 @@ class CommandCard(CardWidget):
         bg_rect = QRectF(0, 0, self.width(), self.height())
         bg_path.addRoundedRect(bg_rect, r, r)
 
+        # 使用毛玻璃半透明背景，让模糊光斑透出（与全局 CardWidget alpha 保持一致）
+        try:
+            from app.components.glass_style import get_card_alpha
+            _glass_alpha = get_card_alpha(dark=isDarkTheme())
+        except Exception:
+            _glass_alpha = 200 if not isDarkTheme() else 30
+
         if isDarkTheme():
             if self._selected:
-                bg_color = QColor(243, 211, 231, int(255 * 0.85))
+                bg_color = QColor(212, 230, 250, int(255 * 0.85))
             else:
-                bg_color = QColor("#252526")
+                bg_color = QColor(37, 37, 38, _glass_alpha)
         else:
-            bg_color = QColor("#FFFFFF")
+            bg_color = QColor(255, 255, 255, _glass_alpha)
 
         painter.setBrush(bg_color)
         painter.drawPath(bg_path)
@@ -307,12 +268,12 @@ class CommandCard(CardWidget):
 
         if isDarkTheme():
             if self._selected:
-                border_color = QColor("#C084D0")
+                border_color = QColor("#4A90E2")
             else:
                 border_color = QColor("#2E2E3E")
         else:
             if self._selected:
-                border_color = QColor("#C4B5FD")
+                border_color = QColor("#2A74DA")
             else:
                 border_color = QColor("#E5E7EB")
 
@@ -322,7 +283,7 @@ class CommandCard(CardWidget):
 
         # 选中时绘制左侧 accent bar
         if self._selected:
-            accent_color = QColor("#8B5CF6") if isDarkTheme() else QColor("#7C3AED")
+            accent_color = QColor("#4A90E2") if isDarkTheme() else QColor("#2A74DA")
             bar_rect = QRectF(4, 12, 4, self.height() - 24)
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(accent_color)
@@ -384,7 +345,12 @@ class CommandEditDialog(QDialog):
         self._step = 1
         self.setWindowTitle(title)
         self.setMinimumWidth(520)
-        self.setStyleSheet(_dialog_stylesheet())
+        try:
+            from app.components.dialog_styles import setup_dialog_window
+            setup_dialog_window(self)
+        except Exception:
+            pass
+        self.setStyleSheet(dialog_stylesheet())
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
@@ -433,7 +399,6 @@ class CommandEditDialog(QDialog):
         self.btn_cancel = PushButton("取消")
         self.btn_cancel.setFixedHeight(36)
         self.btn_cancel.setMinimumWidth(80)
-        self.btn_cancel.setStyleSheet("color: #1D1B20;")
         self.btn_cancel.clicked.connect(self.reject)
         btn_layout.addWidget(self.btn_cancel)
 
@@ -872,23 +837,32 @@ class QuickCommandsTab(QWidget):
         self.v_layout.addWidget(self.scroll_area)
 
         self.scroll_widget = QWidget(self.scroll_area)
-        self.scroll_widget.setStyleSheet("QWidget {background: transparent;}")
+        self.scroll_widget.setStyleSheet("background: transparent;")
         self.scroll_area.setWidget(self.scroll_widget)
 
         self.layout = QVBoxLayout(self.scroll_widget)
-        self.layout.setContentsMargins(32, 32, 32, 32)
+        self.layout.setContentsMargins(20, 20, 20, 20)
         self.layout.setSpacing(24)
 
-        # ---- Banner ----
-        self.banner_card = CardWidget(self)
-        banner_layout = QHBoxLayout(self.banner_card)
-        banner_layout.setContentsMargins(24, 18, 24, 18)
+        # ---- Banner（与其他Tab统一：QWidget[banner="true"]）----
+        self.banner_w = QWidget(self.scroll_widget)
+        try:
+            self.banner_w.setProperty("banner", "true")
+            self.banner_w.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        except Exception:
+            pass
+        self.banner_w.setFixedHeight(110)
+        apply_banner_style(self.banner_w)
+
+        banner_layout = QHBoxLayout(self.banner_w)
+        banner_layout.setContentsMargins(20, 20, 20, 20)
         banner_layout.setSpacing(16)
 
-        icon_lbl = QLabel("", self.banner_card)
+        icon_lbl = QLabel("", self.banner_w)
         icon_lbl.setStyleSheet("background: transparent;")
         icon_lbl.setFixedSize(48, 48)
         icon_lbl.setAlignment(Qt.AlignCenter)
+        icon_lbl._fluent_icon = FluentIcon.COMMAND_PROMPT
         try:
             _ico = FluentIcon.COMMAND_PROMPT.icon(ThemeColor.LIGHT_1 if isDarkTheme() else ThemeColor.DARK_1)
             icon_lbl.setPixmap(_ico.pixmap(48, 48))
@@ -897,29 +871,32 @@ class QuickCommandsTab(QWidget):
 
         title_col = QVBoxLayout()
         title_col.setContentsMargins(0, 0, 0, 0)
-        title_col.setSpacing(4)
+        title_col.setSpacing(2)
 
-        self.banner_title = SubtitleLabel("快捷指令")
-        self.banner_title.setStyleSheet("font-size: 22px; font-weight: 600;")
+        self.banner_title = QLabel("快捷指令", self.banner_w)
+        self.banner_title.setStyleSheet("font-size: 22px; font-weight: 600; background: transparent;")
         title_col.addWidget(self.banner_title)
 
-        self.banner_subtitle = CaptionLabel("自定义ADB/Fastboot快捷命令")
-        self.banner_subtitle.setStyleSheet("font-size: 14px;")
+        self.banner_subtitle = QLabel("自定义ADB/Fastboot/CMD快捷命令", self.banner_w)
+        _sub_color = "#9CA3AF" if isDarkTheme() else "#86909c"
+        self.banner_subtitle.setStyleSheet(f"font-size: 13px; color: {_sub_color}; background: transparent;")
         title_col.addWidget(self.banner_subtitle)
 
         banner_layout.addWidget(icon_lbl)
         banner_layout.addLayout(title_col)
         banner_layout.addStretch(1)
 
-        self.layout.addWidget(self.banner_card)
+        self.layout.addWidget(self.banner_w)
 
         # ---- 主体左右分栏 ----
         main_h_layout = QHBoxLayout()
         main_h_layout.setSpacing(24)
+        main_h_layout.setContentsMargins(0, 0, 0, 0)
 
         # -- 左侧：指令列表 --
         left_col = QVBoxLayout()
         left_col.setSpacing(12)
+        left_col.setContentsMargins(0, 0, 0, 0)
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
@@ -951,6 +928,7 @@ class QuickCommandsTab(QWidget):
         # -- 右侧：执行日志 --
         right_col = QVBoxLayout()
         right_col.setSpacing(12)
+        right_col.setContentsMargins(0, 0, 0, 0)
 
         log_header = QHBoxLayout()
         log_title = StrongBodyLabel("执行日志")
@@ -985,10 +963,16 @@ class QuickCommandsTab(QWidget):
     def _on_add_command(self):
         dlg = CommandEditDialog(self.window(), title="新增指令")
         if show_blur_custom(self.window(), dlg) and dlg.get_data():
-            self._commands.append(dlg.get_data())
+            data = dlg.get_data()
+            self._commands.append(data)
             self._save_commands()
             self._refresh_grid()
-            self._append_log(f"[新增] 指令 \"{dlg.get_data()['name']}\" 已添加")
+            self._append_log(f"[新增] 指令 \"{data['name']}\" 已添加")
+            try:
+                from app.services import log_service
+                log_service.log_ui_action("快捷指令-新增", f"{data['name']}")
+            except Exception:
+                pass
 
     def _on_delete_selected(self):
         idx = self.cmd_grid.get_selected_index()
@@ -1000,8 +984,18 @@ class QuickCommandsTab(QWidget):
         self._save_commands()
         self._refresh_grid()
         self._append_log(f"[删除] 指令 \"{removed['name']}\" 已移除")
+        try:
+            from app.services import log_service
+            log_service.log_ui_action("快捷指令-删除", f"{removed['name']}")
+        except Exception:
+            pass
 
     def _on_restore_default(self):
+        try:
+            from app.services import log_service
+            log_service.log_ui_action("快捷指令-恢复默认")
+        except Exception:
+            pass
         self._commands = self._default_commands()
         self._save_commands()
         self._refresh_grid()
@@ -1050,6 +1044,11 @@ class QuickCommandsTab(QWidget):
 
     def _start_execute_thread(self, cmd_data: dict):
         """启动后台线程执行指令"""
+        try:
+            from app.services import log_service
+            log_service.log_ui_action("快捷指令-执行", cmd_data.get('name', '') if isinstance(cmd_data, dict) else '')
+        except Exception:
+            pass
         self._set_execute_buttons_enabled(False)
 
         self._exec_worker = _ExecuteWorker(cmd_data, parent=self)
@@ -1068,16 +1067,30 @@ class QuickCommandsTab(QWidget):
         if self._exec_worker is not None:
             self._exec_worker.quit()
 
+        try:
+            from app.services import log_service
+        except Exception:
+            log_service = None
         if all_ok:
             if popup_message:
                 show_blur_info(self.window(), "执行成功", popup_message)
             else:
                 InfoBar.success("执行成功", f'"{name}" 已成功执行。', parent=self, duration=3000, position=InfoBarPosition.TOP)
+            if log_service:
+                try:
+                    log_service.log_operation("快捷指令", success=True, detail=name)
+                except Exception:
+                    pass
         else:
             if popup_message:
                 show_blur_info(self.window(), "执行失败", "执行出错，请查看日志输出窗口")
             else:
                 InfoBar.error("执行失败", f'"{name}" 执行失败。', parent=self, duration=4000, position=InfoBarPosition.TOP)
+            if log_service:
+                try:
+                    log_service.log_operation("快捷指令", success=False, detail=name)
+                except Exception:
+                    pass
 
     def _set_execute_buttons_enabled(self, enabled: bool):
         """执行期间禁用按钮防连点"""
@@ -1100,9 +1113,19 @@ class QuickCommandsTab(QWidget):
         except Exception:
             pass
 
+    def refresh_theme(self):
+        """主题切换时刷新 banner 样式。"""
+        if hasattr(self, 'banner_w'):
+            refresh_banner_style(self.banner_w)
+
     # ---- 日志 ----
     def _append_log(self, text: str, color: str = None, bold: bool = False):
         self.log_widget.append_log(text, color=color, bold=bold)
 
     def _on_clear_log(self):
+        try:
+            from app.services import log_service
+            log_service.log_ui_action("快捷指令-清空日志窗口")
+        except Exception:
+            pass
         self.log_widget.clear_log()

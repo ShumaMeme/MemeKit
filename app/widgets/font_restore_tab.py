@@ -7,28 +7,68 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QThread, Signal, QObject
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QDialog,
-    QFileDialog, QCheckBox, QGridLayout, QScrollArea,
+    QFileDialog, QGridLayout, QScrollArea,
 )
 
 from qfluentwidgets import (
     CardWidget, PrimaryPushButton, PushButton, FluentIcon,
     InfoBar, InfoBarPosition, CaptionLabel,
-    BodyLabel, SubtitleLabel, TitleLabel, LineEdit,
-    isDarkTheme, ThemeColor,
+    SubtitleLabel, LineEdit, isDarkTheme, ThemeColor, CheckBox,
 )
 
 from app import get_project_root
 from app.components.log_widget import LogWidget
 from app.components.blur_popup import show_blur_info, show_blur_dialog, show_blur_custom
+from app.components.glass_style import apply_banner_style, refresh_banner_style
 
 
 # ---------------------------------------------------------------------------
 # 弹窗样式（与快捷指令新增指令弹窗保持一致）
 # ---------------------------------------------------------------------------
 from app.components.dialog_styles import dialog_stylesheet
+
+
+# ---------------------------------------------------------------------------
+# 后台 Worker：异步检测 Fastboot 设备，避免阻塞 UI 线程
+# ---------------------------------------------------------------------------
+class _DeviceDetectWorker(QThread):
+    """在后台线程检测 Fastboot 设备连接状态。"""
+    result_ready = Signal(bool, str)  # has_device, serial
+
+    def __init__(self, fastboot_path: str, parent=None):
+        super().__init__(parent)
+        self.fastboot_path = fastboot_path
+
+    def _silent_kwargs(self):
+        kw = {}
+        try:
+            if os.name == 'nt':
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                kw = {'startupinfo': si, 'creationflags': subprocess.CREATE_NO_WINDOW}
+        except Exception:
+            pass
+        return kw
+
+    def run(self):
+        try:
+            proc = subprocess.run(
+                [self.fastboot_path, "devices"],
+                capture_output=True, text=True, timeout=5,
+                **self._silent_kwargs(),
+            )
+            out = proc.stdout or ""
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and not parts[0].lower().startswith("(bootloader)"):
+                    self.result_ready.emit(True, parts[0])
+                    return
+        except Exception:
+            pass
+        self.result_ready.emit(False, "")
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +280,7 @@ class _FontRestoreWorker(QThread):
                         break
 
             # Step 4: 汇总
-            self.log.emit(f"\n===== 刷写完成 =====")
+            self.log.emit("\n===== 刷写完成 =====")
             self.log.emit(f"成功: {success_count}  失败: {fail_count}  总计: {total}")
             self.result_ready.emit(0 if fail_count == 0 else 1)
 
@@ -259,15 +299,16 @@ class _RestoreConfirmDialog(QDialog):
         self.setModal(True)
         self.setMinimumWidth(600)
         self.setMinimumHeight(500)
+        try:
+            from app.components.dialog_styles import setup_dialog_window
+            setup_dialog_window(self)
+        except Exception:
+            pass
         self.setStyleSheet(dialog_stylesheet())
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(12)
-
-        title_lbl = SubtitleLabel("确认刷写分区镜像", self)
-        title_lbl.setStyleSheet("color: #1D1B20;")
-        layout.addWidget(title_lbl)
 
         self.img_files = img_files
         self.checkboxes = {}
@@ -275,10 +316,8 @@ class _RestoreConfirmDialog(QDialog):
         # 工具按钮
         tools = QHBoxLayout()
         btn_all = PushButton("全选")
-        btn_all.setStyleSheet("color: #1D1B20;")
         btn_all.clicked.connect(self._select_all)
         btn_inv = PushButton("反选")
-        btn_inv.setStyleSheet("color: #1D1B20;")
         btn_inv.clicked.connect(self._invert)
         tools.addWidget(btn_all)
         tools.addWidget(btn_inv)
@@ -311,7 +350,6 @@ class _RestoreConfirmDialog(QDialog):
         btn_ok = PrimaryPushButton("确定刷写", self)
         btn_ok.clicked.connect(self.accept)
         btn_cancel = PushButton("取消", self)
-        btn_cancel.setStyleSheet("color: #1D1B20;")
         btn_cancel.clicked.connect(self.reject)
         btn_layout.addWidget(btn_ok)
         btn_layout.addWidget(btn_cancel)
@@ -323,9 +361,8 @@ class _RestoreConfirmDialog(QDialog):
         row, col = 0, 0
         for f in self.img_files:
             display_name = f.name
-            chk = QCheckBox(display_name)
+            chk = CheckBox(display_name)
             chk.setChecked(True)
-            chk.setStyleSheet("color: #1D1B20;")
             self.grid.addWidget(chk, row, col)
             self.checkboxes[display_name] = (chk, f)
             col += 1
@@ -392,21 +429,29 @@ class FontRestoreTab(QWidget):
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 16, 20, 16)
-        layout.setSpacing(12)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(24)
 
         # ---- Banner ----
         banner_w = QWidget(self)
+        self.banner_w = banner_w
+        try:
+            banner_w.setProperty("banner", "true")
+            banner_w.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        except Exception:
+            pass
         banner_w.setFixedHeight(110)
-        banner_w.setStyleSheet("background: transparent;")
+        apply_banner_style(banner_w)
+        # Banner 背景由 glass_widgets_qss() 的 QWidget[banner="true"] 规则控制
         banner = QHBoxLayout(banner_w)
-        banner.setContentsMargins(24, 18, 24, 18)
+        banner.setContentsMargins(20, 20, 20, 20)
         banner.setSpacing(16)
 
         icon_lbl = QLabel("", banner_w)
         icon_lbl.setStyleSheet("background: transparent;")
         icon_lbl.setFixedSize(48, 48)
         icon_lbl.setAlignment(Qt.AlignCenter)
+        icon_lbl._fluent_icon = FluentIcon.PLAY
         try:
             _ico = FluentIcon.PLAY.icon(ThemeColor.LIGHT_1 if isDarkTheme() else ThemeColor.DARK_1)
             icon_lbl.setPixmap(_ico.pixmap(48, 48))
@@ -479,6 +524,11 @@ class FontRestoreTab(QWidget):
         if folder:
             self._img_dir = folder
             self.folder_edit.setText(folder)
+            try:
+                from app.services import log_service
+                log_service.log_file_event("选择", folder)
+            except Exception:
+                pass
             # 预览镜像文件
             img_files = []
             try:
@@ -495,6 +545,11 @@ class FontRestoreTab(QWidget):
                     self.log.append_log(f"  - {f.name} ({size_mb:.1f} MB)")
 
     def _start_restore(self):
+        try:
+            from app.services import log_service
+            log_service.log_ui_action("字库还原-开始")
+        except Exception:
+            pass
         if not self._img_dir or not os.path.isdir(self._img_dir):
             show_blur_info(self.window(), "提示", "请先选择字库备份目录")
             return
@@ -522,8 +577,19 @@ class FontRestoreTab(QWidget):
         selected_files = dlg.get_selected()
         self.log.append_log(f"已选择 {len(selected_files)} 个镜像文件")
 
-        # 启动前检测设备连接状态
-        has_device, serial = self._detect_device()
+        # 异步检测设备连接状态，避免阻塞 UI 线程
+        self._pending_files = selected_files
+        self.btn_start.setEnabled(False)
+        self.log.append_log("正在检测 Fastboot 设备连接...")
+        self._detect_worker = _DeviceDetectWorker(self._fastboot_path, parent=self)
+        self._detect_worker.result_ready.connect(self._on_start_detect_finished)
+        self._detect_worker.result_ready.connect(self._detect_worker.quit)
+        self._detect_worker.result_ready.connect(self._detect_worker.deleteLater)
+        self._detect_worker.start()
+
+    def _on_start_detect_finished(self, has_device: bool, serial: str):
+        """启动前设备检测完成回调。"""
+        self.btn_start.setEnabled(True)
         if not has_device:
             show_blur_info(
                 self.window(), "设备未连接",
@@ -532,6 +598,11 @@ class FontRestoreTab(QWidget):
                 "并正确连接 USB 数据线后重试。"
             )
             return
+
+        selected_files = getattr(self, '_pending_files', None)
+        if not selected_files:
+            return
+        self._pending_files = None
 
         self.log.clear_log()
         self.log.append_log(f"开始字库还原流程... 已识别设备: {serial}")
@@ -566,18 +637,32 @@ class FontRestoreTab(QWidget):
         self.btn_start.setEnabled(True)
         self.btn_cancel.setEnabled(False)
 
+        try:
+            from app.services import log_service
+        except Exception:
+            log_service = None
         if code == 0:
             show_blur_dialog(
                 self.window(), "刷写完成",
                 "所有分区镜像已刷写完毕！"
             )
             InfoBar.success("完成", "所有分区镜像刷写完毕", parent=self, position=InfoBarPosition.TOP, isClosable=True)
+            if log_service:
+                try:
+                    log_service.log_operation("字库还原", success=True)
+                except Exception:
+                    pass
         elif code == 1:
             show_blur_dialog(
                 self.window(), "刷写完成（部分失败）",
                 "刷写流程结束，部分分区刷写失败。\n\n请检查日志确认失败的分区。"
             )
             InfoBar.warning("完成", "刷写流程结束（部分失败）", parent=self, position=InfoBarPosition.TOP, isClosable=True)
+            if log_service:
+                try:
+                    log_service.log_operation("字库还原", success=False, detail="部分分区失败")
+                except Exception:
+                    pass
         else:
             show_blur_dialog(
                 self.window(), "刷写异常",
@@ -585,10 +670,22 @@ class FontRestoreTab(QWidget):
             )
             InfoBar.error("完成", "刷写流程异常中断", parent=self, position=InfoBarPosition.TOP, isClosable=True)
             self.log.append_log("流程异常中断，可能需要重新连接设备后重试。")
+            if log_service:
+                try:
+                    log_service.log_operation("字库还原", success=False, detail=f"异常 code={code}")
+                except Exception:
+                    pass
             return
 
-        # 只有在设备仍然连接的情况下才询问是否重启
-        has_device, serial = self._detect_device()
+        # 异步检测设备是否仍然连接，避免阻塞 UI 线程
+        self._post_detect_worker = _DeviceDetectWorker(self._fastboot_path, parent=self)
+        self._post_detect_worker.result_ready.connect(self._on_post_detect_finished)
+        self._post_detect_worker.result_ready.connect(self._post_detect_worker.quit)
+        self._post_detect_worker.result_ready.connect(self._post_detect_worker.deleteLater)
+        self._post_detect_worker.start()
+
+    def _on_post_detect_finished(self, has_device: bool, serial: str):
+        """刷写完成后设备检测回调，决定是否询问重启。"""
         if not has_device:
             self.log.append_log("设备已断开连接，跳过重启询问。")
             return
@@ -605,6 +702,11 @@ class FontRestoreTab(QWidget):
             self.log.append_log("已跳过重启")
 
     def _cancel(self):
+        try:
+            from app.services import log_service
+            log_service.log_ui_action("字库还原-取消")
+        except Exception:
+            pass
         if self._worker:
             self._worker.stop()
         if self._worker and self._worker.isRunning():
@@ -613,6 +715,11 @@ class FontRestoreTab(QWidget):
         self.btn_start.setEnabled(True)
         self.btn_cancel.setEnabled(False)
         self.log.append_log("用户取消操作")
+
+    def refresh_theme(self):
+        """主题切换时刷新 banner 样式。"""
+        if hasattr(self, 'banner_w'):
+            refresh_banner_style(self.banner_w)
 
     def cleanup(self):
         # 关闭时不通过 _cancel() 避免阻塞 wait

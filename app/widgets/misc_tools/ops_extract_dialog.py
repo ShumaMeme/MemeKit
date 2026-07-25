@@ -1,6 +1,7 @@
 import os
+from threading import Event
 
-from PySide6.QtCore import Signal, QThread, Qt
+from PySide6.QtCore import Signal, QThread
 from PySide6.QtWidgets import (
     QDialog,
     QVBoxLayout,
@@ -20,54 +21,56 @@ from qfluentwidgets import (
     PrimaryPushButton,
 )
 
-from app.logic.payload_extractor import PayloadExtractor
 
+class _OpsWorker(QThread):
+    """OPS 固件解包后台线程
 
-class _PayloadWorker(QThread):
+    使用开源 opscrypto 算法（SM4-like 自定义加密）解密一加 .ops 固件。
+    算法来源: https://github.com/bkerler/oppo_decrypt (MIT License)
+    """
     log = Signal(str)
-    step_start = Signal(str, str)
-    step_finish = Signal(str, bool, str)
     result_ready = Signal()
     error = Signal(str)
 
-    def __init__(self, source: str, out_dir: str, partitions: list, parent=None):
+    def __init__(self, source: str, out_dir: str, parent=None):
         super().__init__(parent)
         self.source = source
         self.output_dir = out_dir
-        self.partitions = partitions
-        self._stop = False
-        self._extractor = None
+        self._cancel_event = Event()
 
     def stop(self):
-        self._stop = True
-        try:
-            if self._extractor is not None:
-                self._extractor.stop()
-        except Exception:
-            pass
+        self._cancel_event.set()
 
     def run(self):
         try:
-            self._extractor = PayloadExtractor(
-                log_callback=self.log.emit,
-                step_start=self.step_start.emit,
-                step_finish=self.step_finish.emit
+            from app.logic.ops_crypto import extract_ops
+
+            def log_cb(msg):
+                self.log.emit(msg)
+
+            ok = extract_ops(
+                self.source,
+                self.output_dir,
+                log_callback=log_cb,
+                cancel_event=self._cancel_event,
             )
-            ok = self._extractor.extract(self.source, self.output_dir, self.partitions)
-            if ok:
+
+            if self._cancel_event.is_set():
+                self.error.emit("用户取消操作")
+            elif ok:
                 self.result_ready.emit()
             else:
-                self.error.emit("提取失败")
+                self.error.emit("OPS 解包失败，请查看日志")
         except Exception as e:
             self.error.emit(str(e))
-        finally:
-            self._extractor = None
 
 
-class _PayloadExtractDialog(QDialog):
+class _OpsExtractDialog(QDialog):
+    """OPS 固件解包对话框，UI 布局与 Payload.bin 解包保持一致"""
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Payload.bin 处理")
+        self.setWindowTitle("OPS 解包")
         self.resize(920, 640)
         self._worker = None
         # 无边框 + 透明背景 + 毛玻璃样式
@@ -89,8 +92,8 @@ class _PayloadExtractDialog(QDialog):
         header_lay = QVBoxLayout(header)
         header_lay.setContentsMargins(16, 14, 16, 14)
         header_lay.setSpacing(4)
-        header_lay.addWidget(TitleLabel('Payload.bin 解包', header))
-        header_lay.addWidget(CaptionLabel('支持本地 Payload.bin/zip 提取', header))
+        header_lay.addWidget(TitleLabel('OPS 解包', header))
+        header_lay.addWidget(CaptionLabel('OnePlus OPS 加密固件解包（自动解密分区镜像）', header))
         layout.addWidget(header)
 
         file_card = CardWidget(self)
@@ -102,23 +105,13 @@ class _PayloadExtractDialog(QDialog):
         file_row = QHBoxLayout()
         file_row.setSpacing(8)
         self.local_edit = LineEdit(file_card)
-        self.local_edit.setPlaceholderText("选择 Payload.bin 或包含 Payload.bin 的 zip 文件")
+        self.local_edit.setPlaceholderText("选择 .ops 固件文件")
         btn_browse = PushButton('浏览...', file_card)
         btn_browse.clicked.connect(self._browse_local)
         file_row.addWidget(self.local_edit, 1)
         file_row.addWidget(btn_browse)
         file_layout.addLayout(file_row)
         layout.addWidget(file_card)
-
-        partition_group = CardWidget(self)
-        partition_layout = QVBoxLayout(partition_group)
-        partition_layout.setContentsMargins(16, 12, 16, 12)
-        partition_layout.setSpacing(8)
-        partition_layout.addWidget(BodyLabel('分区过滤（可选）', partition_group))
-        self.partition_edit = LineEdit(partition_group)
-        self.partition_edit.setPlaceholderText("例如: boot,vendor,system 或留空提取全部")
-        partition_layout.addWidget(self.partition_edit)
-        layout.addWidget(partition_group)
 
         out_group = CardWidget(self)
         out_layout = QVBoxLayout(out_group)
@@ -138,7 +131,7 @@ class _PayloadExtractDialog(QDialog):
         layout.addWidget(out_group)
 
         btn_layout = QHBoxLayout()
-        self.run_btn = PrimaryPushButton('开始提取', self)
+        self.run_btn = PrimaryPushButton('开始解包', self)
         self.run_btn.clicked.connect(self._run_extract)
         self.cancel_btn = PushButton('取消', self)
         self.cancel_btn.clicked.connect(self._cancel)
@@ -155,7 +148,6 @@ class _PayloadExtractDialog(QDialog):
 
     def refresh_theme(self):
         """主题切换时刷新内部组件样式。"""
-        # 使用毛玻璃半透明渐变背景（配合 blur_popup 模糊层）
         try:
             from app.components.dialog_styles import dialog_stylesheet
             self.setStyleSheet(dialog_stylesheet())
@@ -171,7 +163,7 @@ class _PayloadExtractDialog(QDialog):
     def _browse_local(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "选择文件", "",
-            "Payload 文件 (payload.bin *.zip);;所有文件 (*.*)"
+            "OPS 固件 (*.ops);;所有文件 (*.*)"
         )
         if path:
             self.local_edit.setText(path)
@@ -204,36 +196,22 @@ class _PayloadExtractDialog(QDialog):
 
         os.makedirs(out_dir, exist_ok=True)
 
-        partitions = self.partition_edit.text().strip()
-
         try:
             from app.services import log_service
             detail = f"源={os.path.basename(source)} 输出={out_dir}"
-            if partitions:
-                detail += f" 分区={partitions}"
-            else:
-                detail += " 分区=全部"
-            log_service.log_ui_action("Payload提取", detail)
+            log_service.log_ui_action("OPS解包", detail)
         except Exception:
             pass
 
         self.run_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
         self.log.clear_log()
-        self.log.append_log("开始提取...")
-        self.log.append_log(f"源: {source}")
-        self.log.append_log(f"输出: {out_dir}")
-        if partitions:
-            self.log.append_log(f"分区: {partitions}")
-        else:
-            self.log.append_log("分区: 全部")
+        self.log.append_log("开始解包...")
         self.log.append_log("")
 
-        self._worker = _PayloadWorker(source, out_dir, partitions, parent=self)
+        self._worker = _OpsWorker(source, out_dir, parent=self)
 
         self._worker.log.connect(lambda msg: self.log.append_log(msg))
-        self._worker.step_start.connect(self.log.start_step, Qt.QueuedConnection)
-        self._worker.step_finish.connect(self.log.finish_step, Qt.QueuedConnection)
         self._worker.result_ready.connect(self._on_finished)
         self._worker.error.connect(self._on_error)
 
@@ -242,7 +220,7 @@ class _PayloadExtractDialog(QDialog):
     def _cancel(self):
         try:
             from app.services import log_service
-            log_service.log_ui_action("Payload提取-取消")
+            log_service.log_ui_action("OPS解包-取消")
         except Exception:
             pass
         if self._worker:
@@ -250,14 +228,11 @@ class _PayloadExtractDialog(QDialog):
         self.log.append_log("\n用户取消操作")
         self._cleanup()
 
-    def _on_log(self, msg):
-        self.log.append_log(msg)
-
     def _on_finished(self):
-        self.log.append_log("\n✅ 提取完成！")
+        self.log.append_log("\n✅ 解包完成！")
         try:
             from app.services import log_service
-            log_service.log_operation("Payload提取", success=True, detail="提取完成")
+            log_service.log_operation("OPS解包", success=True, detail="解包完成")
         except Exception:
             pass
         self._cleanup()
@@ -266,7 +241,7 @@ class _PayloadExtractDialog(QDialog):
         self.log.append_log(f"\n❌ 错误: {error}")
         try:
             from app.services import log_service
-            log_service.log_operation("Payload提取", success=False, detail=str(error))
+            log_service.log_operation("OPS解包", success=False, detail=str(error))
         except Exception:
             pass
         self._cleanup()
@@ -276,13 +251,12 @@ class _PayloadExtractDialog(QDialog):
             self._worker.quit()
             self._worker.wait(100)
         self._worker = None
-        self._worker = None
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
 
     def closeEvent(self, event):
         if self._worker and self._worker.isRunning():
-            result = show_blur_dialog(self, "确认", "提取正在进行中，确定要关闭吗？")
+            result = show_blur_dialog(self, "确认", "解包正在进行中，确定要关闭吗？")
             if not result:
                 event.ignore()
                 return

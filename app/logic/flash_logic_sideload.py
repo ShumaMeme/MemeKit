@@ -4,7 +4,6 @@ ADB Sideload 刷机逻辑
 """
 import os
 import subprocess
-from pathlib import Path
 from typing import Callable
 
 

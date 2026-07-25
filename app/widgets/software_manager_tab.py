@@ -4,7 +4,7 @@ import datetime
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal, QObject, QTimer, QSettings
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSettings
 from PySide6.QtWidgets import (
     QApplication,
     QWidget,
@@ -12,11 +12,9 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QFileDialog,
-    QListWidget,
     QListWidgetItem,
     QProgressBar,
     QStackedWidget,
-    QSizePolicy,
     QDialog,
 )
 
@@ -31,7 +29,6 @@ from qfluentwidgets import (
     InfoBarPosition,
     FluentIcon,
     SmoothScrollArea,
-    MessageBoxBase,
     SubtitleLabel,
     BodyLabel,
     ListWidget,
@@ -42,9 +39,11 @@ from qfluentwidgets import (
 
 from app import get_project_root
 from app.services import adb_service
+from app.services import log_service
 from app.components.log_widget import LogWidget
 from app.components.blur_popup import show_blur_custom
 from app.components.dialog_styles import dialog_stylesheet
+from app.components.glass_style import apply_banner_style, refresh_banner_style
 
 
 def _silent_popen_kwargs() -> dict:
@@ -58,27 +57,47 @@ def _silent_popen_kwargs() -> dict:
     return {}
 
 
-class _RiskConfirmDialog(MessageBoxBase):
+class _RiskConfirmDialog(QDialog):
+    """风险确认弹窗（QDialog + 统一样式，适配深色/浅色主题）。"""
     def __init__(self, title: str, text: str, parent=None):
         super().__init__(parent)
-        self.titleLabel = SubtitleLabel(title, self)
-        self.viewLayout.addWidget(self.titleLabel)
-
-        self.textLabel = BodyLabel(text, self)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setMinimumWidth(420)
         try:
-            self.textLabel.setWordWrap(True)
+            from app.components.dialog_styles import dialog_stylesheet, setup_dialog_window
+            setup_dialog_window(self)
+            self.setStyleSheet(dialog_stylesheet())
         except Exception:
             pass
-        self.viewLayout.addWidget(self.textLabel)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(14)
+
+        self._title_lbl = SubtitleLabel(title, self)
+        layout.addWidget(self._title_lbl)
+
+        self._text_lbl = BodyLabel(text, self)
+        try:
+            self._text_lbl.setWordWrap(True)
+        except Exception:
+            pass
+        layout.addWidget(self._text_lbl)
 
         self._dont_remind = CheckBox("不再提醒", self)
-        self.viewLayout.addWidget(self._dont_remind)
+        layout.addWidget(self._dont_remind)
 
-        try:
-            self.yesButton.setText("继续")
-            self.cancelButton.setText("取消")
-        except Exception:
-            pass
+        from PySide6.QtWidgets import QHBoxLayout as _HBox
+        btn_lay = _HBox()
+        btn_lay.addStretch()
+        self._btn_cancel = PushButton("取消", self)
+        self._btn_ok = PrimaryPushButton("继续", self)
+        self._btn_cancel.clicked.connect(self.reject)
+        self._btn_ok.clicked.connect(self.accept)
+        btn_lay.addWidget(self._btn_cancel)
+        btn_lay.addWidget(self._btn_ok)
+        layout.addLayout(btn_lay)
 
     def dont_remind(self) -> bool:
         try:
@@ -87,31 +106,52 @@ class _RiskConfirmDialog(MessageBoxBase):
             return False
 
 
-class _PackageInputDialog(MessageBoxBase):
+class _PackageInputDialog(QDialog):
+    """包名输入弹窗（QDialog + 统一样式，适配深色/浅色主题）。"""
     def __init__(self, title: str, label: str, default_text: str, parent=None):
         super().__init__(parent)
-        self.titleLabel = SubtitleLabel(title, self)
-        self.viewLayout.addWidget(self.titleLabel)
-
-        self.label = BodyLabel(label, self)
-        self.viewLayout.addWidget(self.label)
-
-        self.edit = LineEdit(self)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setMinimumWidth(420)
         try:
-            self.edit.setText(default_text or "")
+            from app.components.dialog_styles import dialog_stylesheet, setup_dialog_window
+            setup_dialog_window(self)
+            self.setStyleSheet(dialog_stylesheet())
         except Exception:
             pass
-        self.viewLayout.addWidget(self.edit)
 
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(14)
+
+        self._title_lbl = SubtitleLabel(title, self)
+        layout.addWidget(self._title_lbl)
+
+        self._label = BodyLabel(label, self)
+        layout.addWidget(self._label)
+
+        self._edit = LineEdit(self)
         try:
-            self.yesButton.setText("确定")
-            self.cancelButton.setText("取消")
+            self._edit.setText(default_text or "")
+            self._edit.selectAll()
         except Exception:
             pass
+        layout.addWidget(self._edit)
+
+        from PySide6.QtWidgets import QHBoxLayout as _HBox
+        btn_lay = _HBox()
+        btn_lay.addStretch()
+        self._btn_cancel = PushButton("取消", self)
+        self._btn_ok = PrimaryPushButton("确定", self)
+        self._btn_cancel.clicked.connect(self.reject)
+        self._btn_ok.clicked.connect(self.accept)
+        btn_lay.addWidget(self._btn_cancel)
+        btn_lay.addWidget(self._btn_ok)
+        layout.addLayout(btn_lay)
 
     def text(self) -> str:
         try:
-            return str(self.edit.text() or '').strip()
+            return str(self._edit.text() or '').strip()
         except Exception:
             return ''
 
@@ -220,9 +260,17 @@ class _BatchLabelWorker(QThread):
                     if self._stop:
                         break
                     s = (line or '').strip()
-                    if s.startswith('packageName='):
-                        current_pkg = s.split('=', 1)[1].strip()
-                    elif 'nonLocalizedLabel=' in s and current_pkg:
+                    # Extract packageName — value ends at whitespace (other fields may follow on same line)
+                    if 'packageName=' in s:
+                        try:
+                            idx = s.find('packageName=')
+                            rest = s[idx + len('packageName='):]
+                            # Package name is a single token (no spaces)
+                            current_pkg = rest.split()[0] if rest.split() else rest.strip()
+                        except Exception:
+                            pass
+                    # Extract nonLocalizedLabel — use `if` not `elif` so it works on same line as packageName
+                    if 'nonLocalizedLabel=' in s and current_pkg:
                         try:
                             idx = s.find('nonLocalizedLabel=')
                             if idx >= 0:
@@ -262,12 +310,15 @@ class _BatchLabelWorker(QThread):
                                     apk_path = rest[:eq_idx]
                                     pkg_name = rest[eq_idx + 1:].strip()
                                     if pkg_name in remaining:
-                                        pkg_to_path[pkg_name] = apk_path
+                                        # Prefer base.apk — split APKs (split_config.*.apk) lack application-label
+                                        existing = pkg_to_path.get(pkg_name)
+                                        if existing is None or (apk_path.endswith('base.apk') and not existing.endswith('base.apk')):
+                                            pkg_to_path[pkg_name] = apk_path
                             except Exception:
                                 pass
 
                     # Parse APKs using aapt on device
-                    for pkg in remaining[:100]:  # Limit to 100 packages
+                    for pkg in remaining:  # 处理所有未获取到标签的包
                         if self._stop:
                             break
                         if pkg not in pkg_to_path:
@@ -514,6 +565,7 @@ class SoftwareManagerTab(QWidget):
 
         self._batch_label_worker: QThread | None = None
         self._pending_pkgs: list[str] = []
+        self._pending_label_fetch: list[str] = []  # 等待当前 worker 完成后再获取的包列表
 
         self._app_cards: list[_AppCard] = []
 
@@ -523,11 +575,13 @@ class SoftwareManagerTab(QWidget):
         self._current_activity: str = ""
         self._timer: QTimer | None = None
         self._auto_refresh_enabled: bool = True  # 默认开启自动刷新
+        self._current_serial: str = ""  # 用户选中的设备 serial
 
         self._build_ui()
-        self._start_foreground_worker()
-        # 前台实时刷新改为首次展示时启动，避免启动阶段阻塞/卡顿
+        # 性能优化：前台 worker 延迟到首次 showEvent 时启动，
+        # 避免启动阶段创建线程增加 ~89ms 初始化开销
         self._did_first_show = False
+        self._pending_serial_refresh = False  # 等待 Tab 可见时再刷新应用列表
 
         try:
             app = QApplication.instance()
@@ -537,9 +591,17 @@ class SoftwareManagerTab(QWidget):
             pass
 
     def showEvent(self, event):
+        import time as _time
+        import sys as _sys
+        _t_show = _time.perf_counter()
         try:
             if not getattr(self, '_did_first_show', False):
                 self._did_first_show = True
+                # 性能优化：首次显示时才启动前台 worker（减少启动阶段开销）
+                try:
+                    self._start_foreground_worker()
+                except Exception:
+                    pass
                 try:
                     # 同步 UI 状态，但不弹 toast
                     try:
@@ -554,24 +616,66 @@ class SoftwareManagerTab(QWidget):
                     try:
                         if self._timer is None:
                             self._timer = QTimer(self)
-                            self._timer.setInterval(3000)
+                            try:
+                                from app.components.hidden_settings import get_poll_interval
+                                self._timer.setInterval(get_poll_interval("software_fg", 3000))
+                            except Exception:
+                                self._timer.setInterval(3000)
                             self._timer.timeout.connect(self._refresh_foreground_now)
                         if not self._timer.isActive():
                             self._timer.start()
-                        QTimer.singleShot(150, self._refresh_foreground_now)
+                        # 延迟 500ms 再检测前台应用，避免与 Tab paint 事件叠加
+                        QTimer.singleShot(500, self._refresh_foreground_now)
+                    except Exception:
+                        pass
+                # 性能优化：首次显示时延迟刷新应用列表（500ms，等 Tab paint 完成）
+                # 后续不再自动刷新，用户需点击"刷新"按钮
+                QTimer.singleShot(500, self._refresh_apps_silent)
+            else:
+                # 性能优化：Tab 重新可见时恢复前台定时器（在 hideEvent 中停止过）
+                try:
+                    if self._auto_refresh_enabled:
+                        self._resume_foreground_timer()
+                except Exception:
+                    pass
+                # 设备变更时不自动刷新列表，只提示用户
+                if getattr(self, '_pending_serial_refresh', False):
+                    self._pending_serial_refresh = False
+                    try:
+                        self._toast('info', '设备已变更', '点击"刷新"按钮更新应用列表', ms=3000)
                     except Exception:
                         pass
         except Exception:
             pass
+        # 性能分析：showEvent 耗时
+        try:
+            _elapsed_ms = (_time.perf_counter() - _t_show) * 1000
+            if _sys.stderr:
+                _sys.stderr.write(f"[PERF] 软件管理-showEvent: {_elapsed_ms:.1f}ms\n")
+        except Exception:
+            pass
         return super().showEvent(event)
+
+    def hideEvent(self, event):
+        """性能优化：Tab 隐藏时停止前台应用轮询定时器，避免后台 ADB 调用消耗 CPU。
+
+        根因分析：_timer 每 3 秒创建 _ForegroundWorker 执行多次 adb_shell_serial 调用，
+        即使 Tab 不可见也持续运行。未连接设备时，每次调用超时 2 秒 × 4 次 fallback，
+        后台线程堆积 + ADB 子进程启动开销 → 周期性 CPU 峰值 → TAB 切换掉帧。
+        """
+        try:
+            self._pause_foreground_timer()
+        except Exception:
+            pass
+        try:
+            return super().hideEvent(event)
+        except Exception:
+            pass
 
     # -------- UI --------
     def _build_ui(self):
-        PAGE_MARGIN = 24
-        CARD_MARGIN = 16
-        GAP_LG = 12
-        GAP_MD = 10
-        GAP_SM = 8
+        PAGE_MARGIN = 20
+        GAP_LG = 24
 
         outer = QVBoxLayout(self)
         try:
@@ -589,7 +693,7 @@ class SoftwareManagerTab(QWidget):
 
         container = QWidget()
         try:
-            container.setStyleSheet("QWidget {background: transparent;}")
+            container.setStyleSheet("background: transparent;")
         except Exception:
             pass
         scroll.setWidget(container)
@@ -603,12 +707,19 @@ class SoftwareManagerTab(QWidget):
 
         # 顶部 Banner（与其他 Tab 风格一致）
         banner_w = QWidget(self)
+        self.banner_w = banner_w
+        try:
+            banner_w.setProperty("banner", "true")
+            banner_w.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        except Exception:
+            pass
         try:
             banner_w.setFixedHeight(110)
         except Exception:
             pass
+        apply_banner_style(banner_w)
         banner = QHBoxLayout(banner_w)
-        banner.setContentsMargins(PAGE_MARGIN, 18, PAGE_MARGIN, 18)
+        banner.setContentsMargins(PAGE_MARGIN, PAGE_MARGIN, PAGE_MARGIN, PAGE_MARGIN)
         banner.setSpacing(16)
 
         icon_lbl = QLabel("", banner_w)
@@ -616,6 +727,7 @@ class SoftwareManagerTab(QWidget):
             icon_lbl.setStyleSheet("background: transparent;")
             icon_lbl.setFixedSize(48, 48)
             icon_lbl.setAlignment(Qt.AlignCenter)
+            icon_lbl._fluent_icon = FluentIcon.APPLICATION
             try:
                 _ico = FluentIcon.APPLICATION.icon(ThemeColor.LIGHT_1 if isDarkTheme() else ThemeColor.DARK_1)
                 icon_lbl.setPixmap(_ico.pixmap(48, 48))
@@ -648,13 +760,16 @@ class SoftwareManagerTab(QWidget):
         # 主体布局：左(已装列表) 5 : 右(状态、操作) 7
         main_h_layout = QHBoxLayout()
         main_h_layout.setSpacing(24)
-        
+        main_h_layout.setContentsMargins(0, 0, 0, 0)
+
         left_col = QVBoxLayout()
         left_col.setSpacing(24)
+        left_col.setContentsMargins(0, 0, 0, 0)
         self._build_apps_list_card(left_col)
-        
+
         right_col = QVBoxLayout()
         right_col.setSpacing(24)
+        right_col.setContentsMargins(0, 0, 0, 0)
         self._build_state_card(right_col)
         self._build_ops_panel(right_col)
         
@@ -678,9 +793,9 @@ class SoftwareManagerTab(QWidget):
         self.btn_refresh_state.clicked.connect(self._refresh_foreground_now)
         self.chk_auto_refresh.stateChanged.connect(self._toggle_auto_refresh)
         self.btn_clear_selected.clicked.connect(self._clear_selected_pkg)
-        self.btn_refresh_apps.clicked.connect(self._refresh_apps)
+        self.btn_refresh_apps.clicked.connect(lambda: self._refresh_apps())
         self.edt_app_search.textChanged.connect(self._apply_app_filter)
-        self.cb_show_system_apps.stateChanged.connect(self._refresh_apps)
+        self.cb_show_system_apps.stateChanged.connect(lambda: self._refresh_apps())
         # Card selection is handled via _AppCard.clicked signal in _add_app_card
         self.btn_install.clicked.connect(self._install_apk)
         self.btn_freeze.clicked.connect(self._freeze_app)
@@ -730,7 +845,7 @@ class SoftwareManagerTab(QWidget):
         self.apps_scroll.setStyleSheet('QScrollArea{border:none;background:transparent;}')
         self.apps_scroll.setMinimumHeight(200)
         self.apps_container = QWidget()
-        self.apps_container.setStyleSheet('QWidget{background:transparent;}')
+        self.apps_container.setStyleSheet('background:transparent;')
         self.apps_scroll.setWidget(self.apps_container)
         
         self.apps_cards_lay = QVBoxLayout(self.apps_container)
@@ -768,28 +883,34 @@ class SoftwareManagerTab(QWidget):
         grid.setSpacing(12)
         
         # 采用2x2网格展示这四个信息
+        self._info_item_labels = []  # 存储(t, v)用于主题切换刷新
         def _make_info_item(title_text):
             w = QWidget()
             w.setObjectName("infoItem")
             l = QVBoxLayout(w)
             l.setContentsMargins(12, 10, 12, 10)
             l.setSpacing(4)
+            _dark = isDarkTheme()
             w.setStyleSheet("#infoItem {background: rgba(0,0,0,0.03); border-radius: 8px;}")
             t = CaptionLabel(title_text)
-            t.setStyleSheet("color: #86909c;")
+            t.setStyleSheet("color: #86909c;" if not _dark else "color: #9CA3AF;")
             v = BodyLabel('-')
-            v.setStyleSheet("color: #1d2129;")
+            v.setStyleSheet("color: #1d2129;" if not _dark else "color: #E6E1E5;")
             v.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            v.setContextMenuPolicy(Qt.NoContextMenu)
             l.addWidget(t)
             l.addWidget(v)
+            self._info_item_labels.append((t, v))
             return w, v
             
         w1, self.lbl_dev = _make_info_item("当前设备")
         w2, self.lbl_selected = _make_info_item("列表中选中包名")
-        self.lbl_selected.setStyleSheet("color: #7C3AED; font-weight: 600;")
+        _sel_color = "#4A90E2" if isDarkTheme() else "#2A74DA"
+        self.lbl_selected.setStyleSheet(f"color: {_sel_color}; font-weight: 600;")
         w3, self.lbl_pkg = _make_info_item("当前前台包名")
         w4, self.lbl_act = _make_info_item("当前 Activity")
-        self.lbl_act.setStyleSheet("color: rgba(0,0,0,0.62);")
+        _act_color = "rgba(255,255,255,0.62)" if isDarkTheme() else "rgba(0,0,0,0.62)"
+        self.lbl_act.setStyleSheet(f"color: {_act_color};")
         
         grid.addWidget(w1, 0, 0)
         grid.addWidget(w2, 0, 1)
@@ -865,7 +986,9 @@ class SoftwareManagerTab(QWidget):
         l2.setSpacing(16)
         
         op_hint = BodyLabel("默认基于当前前台包名，在左侧列表选中时则基于选中包名。")
-        op_hint.setStyleSheet("color: #4e5969;")
+        _hint_color = "#9CA3AF" if isDarkTheme() else "#4e5969"
+        op_hint.setStyleSheet(f"color: {_hint_color};")
+        self._op_hint_label = op_hint
         l2.addWidget(op_hint)
         
         row1 = QHBoxLayout()
@@ -969,6 +1092,10 @@ class SoftwareManagerTab(QWidget):
                 pass
 
     def _open_oplog(self):
+        try:
+            log_service.log_ui_action("软件管理-操作日志")
+        except Exception:
+            pass
         p = self._oplog_path()
         try:
             if not p.exists():
@@ -989,6 +1116,11 @@ class SoftwareManagerTab(QWidget):
         dlg.setModal(True)
         dlg.setMinimumWidth(680)
         dlg.setMinimumHeight(500)
+        try:
+            from app.components.dialog_styles import setup_dialog_window
+            setup_dialog_window(dlg)
+        except Exception:
+            pass
         dlg.setStyleSheet(dialog_stylesheet())
 
         layout = QVBoxLayout(dlg)
@@ -996,18 +1128,18 @@ class SoftwareManagerTab(QWidget):
         layout.setSpacing(12)
 
         title_lbl = SubtitleLabel("操作记录", dlg)
-        title_lbl.setStyleSheet("color: #1D1B20;")
+        title_lbl.setStyleSheet("background: transparent;")
         layout.addWidget(title_lbl)
 
-        # 滚动文本区域
+        # 滚动文本区域（透明背景让弹窗毛玻璃透出，颜色由 dialog_stylesheet 控制）
         text_edit = QTextEdit()
         text_edit.setReadOnly(True)
+        text_edit.setContextMenuPolicy(Qt.NoContextMenu)
         text_edit.setPlainText(log_text)
         text_edit.setStyleSheet("""
             QTextEdit {
-                background-color: #FFFFFF;
-                color: #1D1B20;
-                border: 1px solid #E0E0E0;
+                background: transparent;
+                border: 1px solid rgba(42, 116, 218, 0.15);
                 border-radius: 6px;
                 padding: 8px;
                 font-size: 13px;
@@ -1040,7 +1172,15 @@ class SoftwareManagerTab(QWidget):
     def _confirm_risky(self, key: str, title: str, text: str) -> bool:
         try:
             settings = QSettings()
-            if bool(settings.value(key, False)):
+            v = settings.value(key, False)
+            # 健壮 bool 转换：QSettings 存 bool 后读回字符串 'true'/'false'
+            if isinstance(v, bool):
+                if v:
+                    return True
+            elif isinstance(v, str):
+                if v.lower() in ("true", "1", "yes"):
+                    return True
+            elif isinstance(v, (int, float)) and v:
                 return True
         except Exception:
             settings = None
@@ -1050,7 +1190,8 @@ class SoftwareManagerTab(QWidget):
         if ok:
             try:
                 if dlg.dont_remind() and settings is not None:
-                    settings.setValue(key, True)
+                    # bool 存为字符串避免歧义
+                    settings.setValue(key, "true")
             except Exception:
                 pass
         return ok
@@ -1069,16 +1210,56 @@ class SoftwareManagerTab(QWidget):
         except Exception:
             pass
 
+    def set_current_serial(self, serial: str):
+        """接收仪表盘广播的设备 serial。
+
+        性能优化：如果当前 Tab 不可见，不立即刷新应用列表（避免无用户查看时
+        浪费 ADB 调用和 CPU），标记 _pending_serial_refresh，等 showEvent 时再刷新。
+        """
+        new_serial = str(serial or "").strip()
+        if new_serial == self._current_serial:
+            return
+        self._current_serial = new_serial
+        # 切换设备后清空已选中项，避免在新设备上误操作
+        self._selected_apk = ""
+        self._selected_pkg = ""
+        self._current_pkg = ""
+        self._current_activity = ""
+        # 更新当前设备标签显示
+        try:
+            if self.lbl_dev:
+                self.lbl_dev.setText(new_serial or '未检测到')
+        except Exception:
+            pass
+        # 性能优化：Tab 不可见时不刷新应用列表，延迟到 showEvent
+        # 这避免了用户未查看软件管理Tab时的无谓 ADB 调用
+        if not self.isVisible():
+            self._pending_serial_refresh = True
+            return
+        # 强制刷新应用列表，即使有 worker 在运行也终止后重启
+        try:
+            if self._apps_worker is not None and self._apps_worker.isRunning():
+                try:
+                    self._apps_worker.quit()
+                    self._apps_worker.wait(500)
+                except Exception:
+                    pass
+                self._apps_worker = None
+                self._apps_out = []
+            self._refresh_apps()
+        except Exception:
+            pass
+
     def _get_default_serial(self) -> str:
+        # 优先使用仪表盘选中的设备
+        if self._current_serial:
+            return self._current_serial
         serials: list[str] = []
         try:
             serials = adb_service.list_devices()
         except Exception:
             serials = []
         if not serials:
-            return ''
-        if len(serials) > 1:
-            # 保持默认连接设备：多设备时不弹框，直接提示用户处理环境（关模拟器/拔掉多余设备）
             return ''
         return serials[0]
 
@@ -1089,14 +1270,7 @@ class SoftwareManagerTab(QWidget):
 
         serial = self._get_default_serial()
         if not serial:
-            try:
-                serials = adb_service.list_devices()
-            except Exception:
-                serials = []
-            if not serials:
-                self._toast('warn', '提示', '未检测到设备')
-            else:
-                self._toast('warn', '提示', f'检测到多个设备({len(serials)})，请仅保留一个设备后再操作')
+            self._toast('warn', '提示', '未检测到设备')
             return
 
         cmd_args = list(args or [])
@@ -1192,6 +1366,11 @@ class SoftwareManagerTab(QWidget):
 
     # -------- actions --------
     def _install_apk(self):
+        try:
+            from app.services import log_service
+            log_service.log_ui_action("软件管理-安装APK")
+        except Exception:
+            pass
         paths, _ = QFileDialog.getOpenFileNames(self, '选择 APK（可多选）', '', 'APK (*.apk);;所有文件 (*.*)')
         if not paths:
             return
@@ -1206,6 +1385,12 @@ class SoftwareManagerTab(QWidget):
         if not ok_paths:
             self._toast('warn', '提示', '选择的 APK 文件不存在')
             return
+
+        try:
+            file_names = [Path(p).name for p in ok_paths]
+            log_service.log_file_event("安装APK", f"{len(ok_paths)} 个文件: {', '.join(file_names)}")
+        except Exception:
+            pass
 
         self._selected_apk = ok_paths[0]
         serial = self._get_default_serial()
@@ -1324,6 +1509,10 @@ class SoftwareManagerTab(QWidget):
         pass
 
     def _clear_selected_pkg(self):
+        try:
+            log_service.log_ui_action("软件管理-清除选择")
+        except Exception:
+            pass
         self._selected_pkg = ''
         # Deselect all cards
         try:
@@ -1361,20 +1550,55 @@ class SoftwareManagerTab(QWidget):
         except Exception:
             pass
 
-    def _refresh_apps(self):
-        if self._apps_worker and self._apps_worker.isRunning():
-            self._toast('info', '提示', '正在刷新应用列表…')
-            return
-        serial = self._get_default_serial()
-        if not serial:
+    def _refresh_apps_silent(self):
+        """首次加载时静默刷新应用列表（不弹"未检测到设备"toast）。
+
+        性能优化：首次进入 TAB 时延迟 500ms 调用，等 Tab paint 完成，
+        避免与 paint 事件叠加导致卡顿。
+        """
+        import time as _time
+        import sys as _sys
+        _t0 = _time.perf_counter()
+        try:
+            if _sys.stderr:
+                _sys.stderr.write(f"[PERF] _refresh_apps_silent 开始\n")
+        except Exception:
+            pass
+        # 如果已有卡片，不重复刷新（用户可能快速来回切换 TAB）
+        if self._app_cards:
             try:
-                serials = adb_service.list_devices()
+                if _sys.stderr:
+                    _sys.stderr.write(f"[PERF] _refresh_apps_silent 跳过（已有卡片）\n")
             except Exception:
-                serials = []
-            if not serials:
+                pass
+            return
+        # 调用 _refresh_apps 但抑制"未检测到设备"的 toast
+        self._refresh_apps(silent=True)
+        _elapsed_ms = (_time.perf_counter() - _t0) * 1000
+        try:
+            if _sys.stderr:
+                _sys.stderr.write(f"[PERF] _refresh_apps_silent 完成: {_elapsed_ms:.1f}ms\n")
+        except Exception:
+            pass
+
+    def _refresh_apps(self, silent: bool = False):
+        import time as _time
+        import sys as _sys
+        _t0 = _time.perf_counter()
+        try:
+            log_service.log_ui_action("软件管理-刷新应用列表")
+        except Exception:
+            pass
+        if self._apps_worker and self._apps_worker.isRunning():
+            if not silent:
+                self._toast('info', '提示', '正在刷新应用列表…')
+            return
+        # 性能优化：优先使用已缓存的 _current_serial，避免同步调用 list_devices()
+        serial = self._current_serial
+        if not serial:
+            # 没有缓存 serial，静默返回（不阻塞 UI 做 ADB 调用）
+            if not silent:
                 self._toast('warn', '提示', '未检测到设备')
-            else:
-                self._toast('warn', '提示', f'检测到多个设备({len(serials)})，请仅保留一个设备后再操作')
             return
 
         show_system = False
@@ -1394,6 +1618,12 @@ class SoftwareManagerTab(QWidget):
         self._apps_worker.result_ready.connect(self._apps_worker.quit)
         self._apps_worker.result_ready.connect(self._apps_worker.deleteLater)
         self._apps_worker.start()
+        _elapsed_ms = (_time.perf_counter() - _t0) * 1000
+        try:
+            if _sys.stderr:
+                _sys.stderr.write(f"[PERF] _refresh_apps 启动 worker: {_elapsed_ms:.1f}ms serial={serial}\n")
+        except Exception:
+            pass
 
     def _on_apps_output(self, line: str):
         try:
@@ -1411,18 +1641,18 @@ class SoftwareManagerTab(QWidget):
                     pkgs.append(s.split(':', 1)[1].strip())
             pkgs = sorted(set([p for p in pkgs if p]))
 
-            # Show cards immediately with cached labels
+            # 性能优化：分批创建卡片，避免 100+ CardWidget 同步创建冻结 UI
+            # 旧实现：for p in pkgs: self._add_app_card(p, label)  → 同步创建所有卡片
+            # 新实现：每批最多 20 个卡片，通过 QTimer.singleShot(0) 分散到多个事件循环 tick
             cur = self._selected_pkg
             self._clear_app_cards()
-            for p in pkgs:
-                label = self._label_cache.get(p, '')
-                self._add_app_card(p, label)
-            self._apply_app_filter()
-            if cur:
-                for card in self._app_cards:
-                    if card.pkg == cur:
-                        self._on_app_card_clicked(card)
-                        break
+            self._pending_app_pkgs = pkgs
+            self._pending_app_cur = cur
+            self._pending_app_batch_size = 20
+            self._pending_app_total = len(pkgs)
+            self._pending_app_created = 0
+            # 首批立即创建，后续批次通过 timer 分散
+            self._batch_create_cards()
 
             # Start batch label fetch in background to update labels
             self._pending_pkgs = pkgs
@@ -1435,23 +1665,90 @@ class SoftwareManagerTab(QWidget):
         self._apps_worker = None
         self._apps_out = []
 
+    def _batch_create_cards(self):
+        """分批创建应用卡片，每批最多 _pending_app_batch_size 个。
+
+        性能优化：100+ CardWidget 同步创建会阻塞事件循环 200-500ms，
+        导致首次点击软件管理 TAB 时明显卡顿。分批创建让事件循环有机会
+        处理 paint 事件，保持 UI 响应。
+
+        额外优化：每批创建期间禁用更新（setUpdatesEnabled），避免每个
+        CardWidget 创建时触发独立的 repaint 事件。
+        """
+        try:
+            pkgs = getattr(self, '_pending_app_pkgs', None)
+            if not pkgs:
+                return
+            batch_size = getattr(self, '_pending_app_batch_size', 20)
+            created = getattr(self, '_pending_app_created', 0)
+            total = len(pkgs)
+            end_idx = min(created + batch_size, total)
+
+            import time as _time
+            import sys as _sys
+            _t0 = _time.perf_counter()
+
+            # 禁用更新，避免每个卡片创建时触发 repaint
+            container = getattr(self, 'apps_container', None)
+            if container is not None:
+                container.setUpdatesEnabled(False)
+            try:
+                for i in range(created, end_idx):
+                    p = pkgs[i]
+                    label = self._label_cache.get(p, '')
+                    self._add_app_card(p, label)
+            finally:
+                if container is not None:
+                    container.setUpdatesEnabled(True)
+
+            self._pending_app_created = end_idx
+            _elapsed_ms = (_time.perf_counter() - _t0) * 1000
+
+            # 首批或每批完成后应用过滤器（让已创建的卡片立即可见）
+            self._apply_app_filter()
+
+            try:
+                if _sys.stderr:
+                    _sys.stderr.write(f"[PERF] 应用卡片批次 {end_idx}/{total}: {_elapsed_ms:.1f}ms\n")
+            except Exception:
+                pass
+
+            # 如果还有剩余卡片，调度下一批
+            if end_idx < total:
+                QTimer.singleShot(0, self._batch_create_cards)
+            else:
+                # 所有卡片创建完成，恢复选中状态
+                cur = getattr(self, '_pending_app_cur', '')
+                if cur:
+                    for card in self._app_cards:
+                        if card.pkg == cur:
+                            self._on_app_card_clicked(card)
+                            break
+                # 清理临时状态
+                self._pending_app_pkgs = None
+                self._pending_app_cur = ''
+                self._pending_app_created = 0
+        except Exception:
+            pass
+
     def _start_batch_label_fetch(self, pkgs: list[str]):
         # Filter out packages we already have labels for
         to_fetch = [p for p in pkgs if p not in self._label_cache]
 
         if not to_fetch:
-            # All labels cached, show cards immediately
-            self._show_app_cards_with_labels()
             return
 
         serial = self._get_default_serial()
         if not serial:
-            # No device, show cards without labels
-            self._show_app_cards_with_labels()
             return
 
         if self._batch_label_worker and self._batch_label_worker.isRunning():
-            # Already fetching, will show when done
+            # 已有 worker 在运行，累积待获取列表（去重），等当前 worker 完成后再处理
+            existing = set(self._pending_label_fetch)
+            for p in to_fetch:
+                if p not in existing:
+                    self._pending_label_fetch.append(p)
+                    existing.add(p)
             return
 
         self._batch_label_worker = _BatchLabelWorker(serial, to_fetch, parent=self)
@@ -1481,7 +1778,24 @@ class SoftwareManagerTab(QWidget):
             pass
         self._pending_pkgs = []
 
+        # 检查是否有等待获取的包列表（在上一轮 worker 运行期间积累的）
+        pending = self._pending_label_fetch
+        self._pending_label_fetch = []
+        if pending:
+            # 过滤掉已缓存的，只获取仍缺失的
+            still_missing = [p for p in pending if p not in self._label_cache]
+            if still_missing:
+                serial = self._get_default_serial()
+                if serial:
+                    self._batch_label_worker = _BatchLabelWorker(serial, still_missing, parent=self)
+                    self._batch_label_worker.result_ready.connect(self._on_batch_label_finished, Qt.QueuedConnection)
+                    self._batch_label_worker.result_ready.connect(self._batch_label_worker.quit)
+                    self._batch_label_worker.result_ready.connect(self._batch_label_worker.deleteLater)
+                    self._batch_label_worker.start()
+
     def _clear_app_cards(self):
+        # 取消任何待处理的批量卡片创建（避免新刷新与旧批次冲突）
+        self._pending_app_pkgs = None
         try:
             for c in self._app_cards:
                 try:
@@ -1521,6 +1835,13 @@ class SoftwareManagerTab(QWidget):
         self._selected_pkg = card.pkg
         try:
             self.lbl_selected.setText(card.pkg)
+        except Exception:
+            pass
+        # 记录选中了哪个APP
+        try:
+            label = getattr(card, 'app_label', '') or ''
+            detail = f"{card.pkg}" + (f"（{label}）" if label else "")
+            log_service.log_ui_action("软件管理-选中APP", detail)
         except Exception:
             pass
         # Lazy load label
@@ -1587,6 +1908,10 @@ class SoftwareManagerTab(QWidget):
         self._label_pkg = ''
 
     def _open_app_permissions(self):
+        try:
+            log_service.log_ui_action("软件管理-打开权限")
+        except Exception:
+            pass
         pkg = self._pkg()
         if not pkg:
             self._toast('warn', '提示', '请先选择应用或确保已获取到前台包名')
@@ -1601,6 +1926,10 @@ class SoftwareManagerTab(QWidget):
         )
 
     def _refresh_disabled_components(self):
+        try:
+            log_service.log_ui_action("软件管理-刷新禁用组件")
+        except Exception:
+            pass
         pkg = self._pkg()
         if not pkg:
             self._toast('warn', '提示', '请先选择应用或确保已获取到前台包名')
@@ -1667,6 +1996,10 @@ class SoftwareManagerTab(QWidget):
         self._disabled_out = []
 
     def _enable_component(self):
+        try:
+            log_service.log_ui_action("软件管理-启用组件")
+        except Exception:
+            pass
         pkg = self._pkg()
         if not pkg:
             self._toast('warn', '提示', '请先选择应用或确保已获取到前台包名')
@@ -1693,6 +2026,11 @@ class SoftwareManagerTab(QWidget):
 
     def _freeze_app(self):
         pkg = self._pkg()
+        try:
+            from app.services import log_service
+            log_service.log_ui_action("软件管理-冻结应用", pkg or "未获取到包名")
+        except Exception:
+            pass
         if not pkg:
             self._toast('warn', '提示', '未获取到前台包名')
             return
@@ -1709,6 +2047,10 @@ class SoftwareManagerTab(QWidget):
 
     def _unfreeze_app(self):
         default_pkg = self._pkg()
+        try:
+            log_service.log_ui_action("软件管理-解冻应用", default_pkg or "未获取到包名")
+        except Exception:
+            pass
         dlg = _PackageInputDialog('解冻应用', '请输入需要解冻的包名：', default_pkg, self)
         if not show_blur_custom(self.window(), dlg):
             return
@@ -1716,6 +2058,11 @@ class SoftwareManagerTab(QWidget):
         if not pkg:
             self._toast('warn', '提示', '包名不能为空')
             return
+        try:
+            if pkg != default_pkg:
+                log_service.log_ui_action("软件管理-解冻应用", f"手动输入: {pkg}")
+        except Exception:
+            pass
         serial = self._get_default_serial()
         if serial:
             self._write_oplog(serial, pkg, 'unfreeze')
@@ -1723,6 +2070,11 @@ class SoftwareManagerTab(QWidget):
 
     def _uninstall_app(self):
         pkg = self._pkg()
+        try:
+            from app.services import log_service
+            log_service.log_ui_action("软件管理-卸载应用", pkg or "未获取到包名")
+        except Exception:
+            pass
         if not pkg:
             self._toast('warn', '提示', '未获取到前台包名')
             return
@@ -1739,6 +2091,10 @@ class SoftwareManagerTab(QWidget):
 
     def _force_stop_app(self):
         pkg = self._pkg()
+        try:
+            log_service.log_ui_action("软件管理-强行停止", pkg or "未获取到包名")
+        except Exception:
+            pass
         if not pkg:
             self._toast('warn', '提示', '未获取到前台包名')
             return
@@ -1755,6 +2111,10 @@ class SoftwareManagerTab(QWidget):
 
     def _uninstall_keep_data(self):
         pkg = self._pkg()
+        try:
+            log_service.log_ui_action("软件管理-保留数据卸载", pkg or "未获取到包名")
+        except Exception:
+            pass
         if not pkg:
             self._toast('warn', '提示', '未获取到前台包名')
             return
@@ -1772,6 +2132,10 @@ class SoftwareManagerTab(QWidget):
 
     def _clear_data(self):
         pkg = self._pkg()
+        try:
+            log_service.log_ui_action("软件管理-清除数据", pkg or "未获取到包名")
+        except Exception:
+            pass
         if not pkg:
             self._toast('warn', '提示', '未获取到前台包名')
             return
@@ -1788,12 +2152,21 @@ class SoftwareManagerTab(QWidget):
 
     def _pull_apk(self):
         pkg = self._pkg()
+        try:
+            log_service.log_ui_action("软件管理-提取APK", pkg or "未获取到包名")
+        except Exception:
+            pass
         if not pkg:
             self._toast('warn', '提示', '未获取到前台包名')
             return
         dst, _ = QFileDialog.getSaveFileName(self, '保存 APK 到电脑', f"{pkg}.apk", 'APK (*.apk);;所有文件 (*.*)')
         if not dst:
             return
+
+        try:
+            log_service.log_file_event("提取APK", f"{pkg} -> {dst}")
+        except Exception:
+            pass
 
         serial = self._get_default_serial()
         if not serial:
@@ -1838,6 +2211,10 @@ class SoftwareManagerTab(QWidget):
     def _disable_current_activity(self):
         pkg = self._pkg()
         act = (self._current_activity or '').strip()
+        try:
+            log_service.log_ui_action("软件管理-禁用当前Activity", f"{pkg} / {act}" if pkg and act else (pkg or "未获取到包名"))
+        except Exception:
+            pass
         if not pkg or not act:
             self._toast('warn', '提示', '未获取到当前 Activity')
             return
@@ -1896,7 +2273,11 @@ class SoftwareManagerTab(QWidget):
             # 开启自动刷新
             if self._timer is None:
                 self._timer = QTimer(self)
-                self._timer.setInterval(3000)
+                try:
+                    from app.components.hidden_settings import get_poll_interval
+                    self._timer.setInterval(get_poll_interval("software_fg", 3000))
+                except Exception:
+                    self._timer.setInterval(3000)
                 self._timer.timeout.connect(self._refresh_foreground_now)
             if not self._timer.isActive():
                 self._timer.start()
@@ -1933,7 +2314,11 @@ class SoftwareManagerTab(QWidget):
         """仅在用户开启自动刷新时调用"""
         if self._timer is None:
             self._timer = QTimer(self)
-            self._timer.setInterval(3000)
+            try:
+                from app.components.hidden_settings import get_poll_interval
+                self._timer.setInterval(get_poll_interval("software_fg", 3000))
+            except Exception:
+                self._timer.setInterval(3000)
             self._timer.timeout.connect(self._refresh_foreground_now)
         if not self._timer.isActive():
             self._timer.start()
@@ -1953,30 +2338,57 @@ class SoftwareManagerTab(QWidget):
         self.lbl_act.setText(self._current_activity or '-')
 
     def _refresh_foreground_now(self):
-        serial = self._get_default_serial()
+        try:
+            log_service.log_ui_action("软件管理-刷新前台")
+        except Exception:
+            pass
+        # 性能优化：优先使用已缓存的 _current_serial，避免同步调用 list_devices()
+        serial = self._current_serial
         if not serial:
+            # 没有缓存 serial，显示"未检测到"并返回（不阻塞 UI 做 ADB 调用）
             try:
-                serials = adb_service.list_devices()
-            except Exception:
-                serials = []
-            if not serials:
                 self.lbl_dev.setText('未检测到')
-            else:
-                self.lbl_dev.setText(f'检测到多个设备({len(serials)})')
-            self.lbl_pkg.setText('-')
-            self.lbl_act.setText('-')
+                self.lbl_pkg.setText('-')
+                self.lbl_act.setText('-')
+            except Exception:
+                pass
             self._current_pkg = ""
             self._current_activity = ""
             return
 
-        self.lbl_dev.setText(serial)
+        try:
+            self.lbl_dev.setText(serial)
+        except Exception:
+            pass
 
         if self._fg_worker is None:
             return
         self._fg_request.emit(serial)
 
+    def refresh_theme(self):
+        """主题切换时刷新文字颜色。"""
+        try:
+            if hasattr(self, 'banner_w'):
+                refresh_banner_style(self.banner_w)
+            _dark = isDarkTheme()
+            _hint = "#9CA3AF" if _dark else "#4e5969"
+            _value = "#E6E1E5" if _dark else "#1d2129"
+            _caption = "#9CA3AF" if _dark else "#86909c"
+            if hasattr(self, '_info_item_labels'):
+                for t, v in self._info_item_labels:
+                    t.setStyleSheet(f"color: {_caption};")
+                    v.setStyleSheet(f"color: {_value};")
+            if hasattr(self, '_op_hint_label'):
+                self._op_hint_label.setStyleSheet(f"color: {_hint};")
+            # lbl_selected 保持蓝色不变（深色模式用亮蓝）
+            if hasattr(self, 'lbl_selected'):
+                _sel = "#4A90E2" if isDarkTheme() else "#2A74DA"
+                self.lbl_selected.setStyleSheet(f"color: {_sel}; font-weight: 600;")
+        except Exception:
+            pass
+
     def cleanup(self):
-        # 优化清理顺序，先停止定时器，再清理线程（不阻塞，避免关闭卡顿）
+        # 优化清理顺序，先停止定时器，再清理线程（短超时 wait，避免关闭卡顿和悬空线程）
         try:
             if self._timer is not None:
                 try:
@@ -1987,66 +2399,61 @@ class SoftwareManagerTab(QWidget):
                     pass
         except Exception:
             pass
-        
+
         # 清理前台刷新线程
         try:
             if self._fg_worker and self._fg_worker.isRunning():
                 self._fg_worker.quit()
-                self._fg_worker = None
+                self._fg_worker.wait(500)
         except Exception:
             pass
-        
+        self._fg_worker = None
+
         # 清理命令执行线程
         try:
             if self._worker:
                 self._worker.stop()
-        except Exception:
-            pass
-        try:
-            if self._worker and self._worker.isRunning():
-                self._worker.quit()
+                if self._worker.isRunning():
+                    self._worker.quit()
+                    self._worker.wait(1000)
         except Exception:
             pass
 
         try:
             if self._apps_worker:
                 self._apps_worker.stop()
-        except Exception:
-            pass
-        try:
-            if self._apps_worker and self._apps_worker.isRunning():
-                self._apps_worker.quit()
+                if self._apps_worker.isRunning():
+                    self._apps_worker.quit()
+                    self._apps_worker.wait(1000)
         except Exception:
             pass
 
         try:
             if self._disabled_worker:
                 self._disabled_worker.stop()
-        except Exception:
-            pass
-        try:
-            if self._disabled_worker and self._disabled_worker.isRunning():
-                self._disabled_worker.quit()
+                if self._disabled_worker.isRunning():
+                    self._disabled_worker.quit()
+                    self._disabled_worker.wait(1000)
         except Exception:
             pass
 
         try:
             if self._label_worker:
                 self._label_worker.stop()
-        except Exception:
-            pass
-        try:
-            if self._label_worker and self._label_worker.isRunning():
-                self._label_worker.quit()
+                if self._label_worker.isRunning():
+                    self._label_worker.quit()
+                    self._label_worker.wait(1000)
         except Exception:
             pass
 
         try:
-            if self._fg_worker and self._fg_worker.isRunning():
-                self._fg_worker.quit()
+            if self._batch_label_worker:
+                self._batch_label_worker.stop()
+                if self._batch_label_worker.isRunning():
+                    self._batch_label_worker.quit()
+                    self._batch_label_worker.wait(1000)
         except Exception:
             pass
-        self._fg_worker = None
 
     def closeEvent(self, event):
         try:

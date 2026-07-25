@@ -1,4 +1,3 @@
-from pathlib import Path
 from PySide6.QtWidgets import QApplication
 from typing import Literal
 
@@ -15,8 +14,12 @@ except Exception:  # pragma: no cover
 ThemeMode = Literal["system", "light", "dark"]
 
 _DARK_OVERLAY = """
-CardWidget { background-color: #1f1f1f; }
-QDialog { background-color: #202020; color: #ffffff; }
+/* 仅设置文字颜色，不设置 background-color，让毛玻璃半透明背景生效。
+   CardWidget 的透明度由 apply_card_glass_alpha() 控制，
+   QDialog 的背景由 dialog_stylesheet() 控制，
+   QTextBrowser 的背景由 glass_widgets_qss() / log_widget 控制。 */
+CardWidget { color: #E6E1E5; }
+QDialog { color: #ffffff; }
 QLabel,
 QTextEdit,
 QPlainTextEdit,
@@ -30,9 +33,19 @@ QTableWidget,
 QTableView {
     color: #ffffff;
 }
+/* FluentWindow 侧边栏与标题栏在深色模式下必须有不透明背景 */
+QFrame#navigationInterface, QFrame#viewLayout, QWidget#navigationInterface {
+    background-color: #1E1E1E;
+}
+FluentTitleBar, QWidget#titleBar {
+    background-color: #1E1E1E;
+}
 """
 
 _LIGHT_OVERLAY = """
+/* 注意：不要给 QWidget 全局设置 background-color，否则会污染 splash/弹窗的子 QLabel，
+   导致透明窗口出现"白色横条"。背景色由各控件自身或更具体的 QSS 规则管理。
+   CardWidget/QDialog/QTextBrowser 不设 background-color，让毛玻璃半透明样式生效。 */
 QWidget { color: #1D1B20; }
 CardWidget { color: #1D1B20; }
 QLabel,
@@ -48,29 +61,19 @@ QTableView {
     color: #1D1B20;
 }
 QTextBrowser {
-    background-color: #F5F3FF;
     color: #1f2329;
-    border: 1px solid #DDD6FE;
-    border-radius: 8px;
-    padding: 10px;
-    selection-background-color: #EDE9FE;
+    selection-background-color: #E3F0FF;
     selection-color: #1f2329;
 }
 QDialog { color: #1D1B20; }
+/* FluentWindow 侧边栏与标题栏在浅色模式下必须有不透明背景，否则会与 DWM 材质叠加导致不可见 */
+QFrame#navigationInterface, QFrame#viewLayout, QWidget#navigationInterface {
+    background-color: #F3F3F3;
+}
+FluentTitleBar, QWidget#titleBar {
+    background-color: #F3F3F3;
+}
 """
-
-
-def _load_qss(app: QApplication, qss_path: Path, fallback_dark: bool = False):
-    if qss_path.exists():
-        css = qss_path.read_text(encoding="utf-8")
-        if css:
-            app.setStyleSheet(css)
-            return
-    # fallback
-    if fallback_dark:
-        app.setStyleSheet("QWidget { background:#121212; color:#E6E1E5; }")
-    else:
-        app.setStyleSheet("QWidget { background:#FFFFFF; color:#1D1B20; }")
 
 
 def detect_windows_theme() -> Literal["light", "dark"]:
@@ -89,20 +92,6 @@ def detect_windows_theme() -> Literal["light", "dark"]:
         return "light"
 
 
-def apply_theme(app: QApplication, mode: ThemeMode = "system"):
-    base = Path(__file__).resolve().parent
-    if mode == "system":
-        sys_mode = detect_windows_theme()
-        qss = base / "assets" / ("md3_light.qss" if sys_mode == "light" else "md3_dark.qss")
-        _load_qss(app, qss, fallback_dark=(sys_mode == "dark"))
-    elif mode == "light":
-        qss = base / "assets" / "md3_light.qss"
-        _load_qss(app, qss, fallback_dark=False)
-    else:  # dark
-        qss = base / "assets" / "md3_dark.qss"
-        _load_qss(app, qss, fallback_dark=True)
-
-
 def apply_runtime_overlay(app: QApplication | None, fallback_dark: bool = False):
     """Apply a lightweight stylesheet overlay so text colors match the current theme."""
     if app is None:
@@ -112,8 +101,3 @@ def apply_runtime_overlay(app: QApplication | None, fallback_dark: bool = False)
     except Exception:
         is_dark = fallback_dark
     app.setStyleSheet(_DARK_OVERLAY if is_dark else _LIGHT_OVERLAY)
-
-
-# Backward compatibility shim
-def load_md3_theme(app: QApplication):
-    apply_theme(app, "dark")

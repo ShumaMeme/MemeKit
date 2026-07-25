@@ -17,28 +17,39 @@ def _is_dark() -> bool:
     return False
 
 
+def _is_perf() -> bool:
+    """性能模式下降级为纯色不透明背景。"""
+    try:
+        from app.components.hidden_settings import is_performance_mode
+        return is_performance_mode()
+    except Exception:
+        return False
+
+
 def _build_stylesheet() -> str:
     """根据当前主题动态构建 LogWidget 的样式表。"""
+    _perf = _is_perf()
     if _is_dark():
-        bg = "#1E1E1E"
+        # 性能模式纯色，毛玻璃模式半透明（降低 alpha 透出背景光斑）
+        bg = "#1E1E1E" if _perf else "rgba(30, 30, 35, 0.50)"
         text = "#E6E1E5"
-        border = "#2A2A2A"
-        sel_bg = "#7C3AED"
+        border = "#2A2A2A" if _perf else "rgba(255, 255, 255, 0.06)"
+        sel_bg = "#2A74DA"
         sel_text = "#FFFFFF"
-        scroll_bg = "#181818"
+        scroll_bg = "#181818" if _perf else "rgba(24, 24, 24, 0.40)"
         handle = "#3A3A3A"
         handle_hover = "#4A4A4A"
-        handle_active = "#7C3AED"
+        handle_active = "#2A74DA"
     else:
-        bg = "#F5F3FF"
+        bg = "#F0F5FF" if _perf else "rgba(255, 255, 255, 0.55)"
         text = "#1f2329"
-        border = "#DDD6FE"
-        sel_bg = "#EDE9FE"
+        border = "#C7DBF5" if _perf else "rgba(42, 116, 218, 0.12)"
+        sel_bg = "#E3F0FF"
         sel_text = "#1f2329"
         scroll_bg = "transparent"
         handle = "rgba(0, 0, 0, 0.22)"
         handle_hover = "rgba(0, 0, 0, 0.34)"
-        handle_active = "rgba(124, 58, 237, 0.55)"
+        handle_active = "rgba(42, 116, 218, 0.55)"
 
     return f"""
         QTextBrowser {{
@@ -139,25 +150,31 @@ class LogWidget(QTextBrowser):
         self.setLineWrapMode(QTextBrowser.WidgetWidth)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setContextMenuPolicy(Qt.NoContextMenu)
 
     def refresh_theme(self):
         """主题切换后重新应用样式表并更新已有文字颜色。"""
-        self.setStyleSheet(_build_stylesheet())
+        # 性能优化：批量更新时禁用重绘，避免多次重排
+        self.setUpdatesEnabled(False)
+        try:
+            self.setStyleSheet(_build_stylesheet())
 
-        # 更新已有文字中默认颜色 → 新主题颜色
-        html = self.toHtml()
-        if _is_dark():
-            # 切换到深色：浅色默认文字 → 深色默认文字
-            html = html.replace("color:#1f2329;", "color:#e6e1e5;")
-        else:
-            # 切换到浅色：深色默认文字 → 浅色默认文字
-            html = html.replace("color:#e6e1e5;", "color:#1f2329;")
-        # 保持滚动位置
-        vbar = self.verticalScrollBar()
-        pos = vbar.value() if vbar else 0
-        self.setHtml(html)
-        if vbar:
-            vbar.setValue(pos)
+            # 更新已有文字中默认颜色 → 新主题颜色
+            html = self.toHtml()
+            if _is_dark():
+                # 切换到深色：浅色默认文字 → 深色默认文字
+                html = html.replace("color:#1f2329;", "color:#e6e1e5;")
+            else:
+                # 切换到浅色：深色默认文字 → 浅色默认文字
+                html = html.replace("color:#e6e1e5;", "color:#1f2329;")
+            # 保持滚动位置
+            vbar = self.verticalScrollBar()
+            pos = vbar.value() if vbar else 0
+            self.setHtml(html)
+            if vbar:
+                vbar.setValue(pos)
+        finally:
+            self.setUpdatesEnabled(True)
 
     def clear_log(self):
         self.clear()
@@ -168,18 +185,24 @@ class LogWidget(QTextBrowser):
         """
         普通的日志追加。
         """
+        # 同步到运行日志（不影响主流程）
+        try:
+            from app.services import log_service
+            log_service.get_logger("OPS").info(str(text))
+        except Exception:
+            pass
         if color is None:
             color = "#E6E1E5" if _is_dark() else "#1f2329"
         self.moveCursor(QTextCursor.End)
         cursor = self.textCursor()
         if not cursor.atBlockStart():
             cursor.insertText("\n")
-            
+
         fmt = QTextCharFormat()
         fmt.setForeground(QColor(color))
         if bold:
             fmt.setFontWeight(QFont.Bold)
-            
+
         cursor.insertText(text, fmt)
         cursor.insertText("\n")
         self.ensureCursorVisible()
@@ -188,21 +211,27 @@ class LogWidget(QTextBrowser):
         """
         开始一个步骤，输出类似 "重启至bootloader..."，并返回该步骤的 ID 以供后续更新状态。
         """
+        # 同步到运行日志
+        try:
+            from app.services import log_service
+            log_service.get_logger("OPS").info(f"[步骤] {text}")
+        except Exception:
+            pass
         self.moveCursor(QTextCursor.End)
         cursor = self.textCursor()
-        
+
         if not cursor.atBlockStart():
             cursor.insertText("\n")
-            
+
         fmt = QTextCharFormat()
         fmt.setForeground(QColor("#1677ff"))
-        
+
         step_text = f"{text}... "
         cursor.insertText(step_text, fmt)
-        
+
         block_num = cursor.blockNumber()
         self._step_blocks[step_id] = block_num
-        
+
         cursor.insertText("\n")
         self.ensureCursorVisible()
 
@@ -212,15 +241,15 @@ class LogWidget(QTextBrowser):
         """
         if step_id not in self._step_blocks:
             return
-            
+
         block_num = self._step_blocks[step_id]
         block = self.document().findBlockByNumber(block_num)
         if not block.isValid():
             return
-            
+
         cursor = QTextCursor(block)
         cursor.movePosition(QTextCursor.EndOfBlock)
-        
+
         fmt = QTextCharFormat()
         fmt.setFontWeight(QFont.Bold)
         if success:
@@ -229,14 +258,23 @@ class LogWidget(QTextBrowser):
         else:
             fmt.setForeground(QColor("#f53f3f")) # 红色 Error
             status_text = "Error"
-            
+
         cursor.insertText(status_text, fmt)
-        
+
         if detail:
             fmt.setForeground(QColor("#f53f3f") if not success else QColor("#4e5969"))
             fmt.setFontWeight(QFont.Normal)
             cursor.insertText(f" ({detail})", fmt)
-            
+
+        # 同步到运行日志
+        try:
+            from app.services import log_service
+            status = "OK" if success else "FAIL"
+            suffix = f" ({detail})" if detail else ""
+            log_service.get_logger("OPS").info(f"[{status}]{suffix}")
+        except Exception:
+            pass
+
         # 恢复光标到末尾并滚动
         self.moveCursor(QTextCursor.End)
         self.ensureCursorVisible()
