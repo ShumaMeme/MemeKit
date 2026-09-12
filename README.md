@@ -8,9 +8,14 @@
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20MacOS-lightgrey.svg)](#)
 
 ## 项目简介
+<div align="center">
 <img width="512" height="512" alt="android-chrome-512x512" src="https://github.com/user-attachments/assets/36a8a46c-424b-4ac8-b5f5-3118dd046cf3" />
+</div>
+
 
 MemeKit 是一款 Android 通用玩机工具箱，依托 ADB / Fastboot 机制实现刷机、ROOT、设备调试、分区管理等全套功能。界面采用 Fluent Design 现代化设计，原生适配 **Windows** 与 **MacOS** 双平台。
+
+<img width="2143" height="1870" alt="retouch_2026082812525465" src="https://github.com/user-attachments/assets/22c97898-8920-4c4b-a4c1-1196bd3007c8" />
 
 - **Windows**：云母 / 毛玻璃特效、原生驱动安装
 - **MacOS**：原生红绿灯标题栏、Apple HIG 规范边距、系统字体渲染
